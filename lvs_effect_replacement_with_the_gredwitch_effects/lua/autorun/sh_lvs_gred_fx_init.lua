@@ -3,13 +3,10 @@
 
     Visual replacement logic is client-side. The single server-side module is
     a purely visual tracer relay: after every mapped LVS shot it sends gred's
-    own gred_net_createtracer message so clients WITHOUT this addon still get
-    the static Gredwitch tracer beam. Clients WITH the addon announce
-    themselves (lvs_gred_fx_client_ready), are excluded from that relay, and
-    render a bullet-following beam locally instead (speed/drop-exact — see
-    lvs_gred_fx/tracer.lua). LVS damage, ballistics, projectile physics,
-    weapon logic, vehicle physics, networking and firing mechanics all run
-    untouched.
+    own gred_net_createtracer message so the Gredwitch base renders the tracer
+    beam on clients (the proven mechanism from the original addon). LVS
+    damage, ballistics, projectile physics, weapon logic, vehicle physics,
+    networking and firing mechanics all run untouched.
 
     Client modules are shipped via AddCSLuaFile and included by
     autorun/client/cl_lvs_gred_fx_override.lua in dependency order. The server

@@ -1,17 +1,14 @@
 --[[---------------------------------------------------------------------------
     LVS → Gredwitch FX : server tracer relay (server-side)
 
-    SPLIT RENDERING:
+    THE PROVEN TRACER MECHANISM (restored from the original addon):
 
-      * Clients WITHOUT this addon get the static gred beam: after every
-        mapped LVS shot we send gred's own gred_net_createtracer message,
-        which gred's client base renders with its gred_particle_tracer
-        effect — a straight CP0→CP1 beam at a fixed per-caliber speed.
-      * Clients RUNNING this addon announce themselves via
-        lvs_gred_fx_client_ready and are EXCLUDED from the relay: they render
-        a bullet-following beam locally (tracer.lua) whose speed and drop
-        exactly match the live LVS bullet — something the static gred beam
-        can never do.
+    Rendering is delegated to Gredwitch's OWN base. After every mapped LVS
+    shot, this module sends gred's own net message (gred_net_createtracer),
+    which gred's client base renders with its own battle-tested
+    gred_particle_tracer effect — the exact same path gred's tanks use. The
+    addon itself never creates a tracer particle system, so there is nothing
+    here that can fail to render.
 
       * LVS:FireBullet is called UNCHANGED first — damage, ballistics,
         projectile physics, networking and firing mechanics are untouched,
@@ -23,24 +20,13 @@
         firing or the weapon that called it.
 
     Clients with this addon suppress the original LVS tracer visual (see
-    tracer.lua); clients without it see LVS's own tracer as before plus,
-    when gred base is present, the relayed gred beam.
+    tracer.lua), so the gred beam is the single tracer. Clients without this
+    addon but with gred base will also render the beam (gred owns the channel).
 -----------------------------------------------------------------------------]]
 
 if not SERVER then return end
 
 LVS_GRED_FX_SV = LVS_GRED_FX_SV or {}
-
-util.AddNetworkString("lvs_gred_fx_client_ready")
-
--- Clients running this addon render their own bullet-following tracer beams
--- (speed/drop-exact, see cl tracer.lua): mark them so the relay can exclude
--- them — a double render (static gred beam + local beam) would be wrong.
-net.Receive("lvs_gred_fx_client_ready", function(_, ply)
-    if IsValid(ply) then
-        ply._lvsGredFxRendersTracers = true
-    end
-end)
 
 -- Mirror of the client config mapping (the client config is client-only).
 local TRACER_MAP = {
@@ -147,21 +133,7 @@ function LVS_GRED_FX_SV.SendTracer(data)
     -- Only send to clients who can actually see the shot (same as LVS's own
     -- bullet networking) — net.Broadcast would push every tracer to every
     -- player, wasting bandwidth with many vehicles firing in multiplayer.
-    -- Clients running this addon are excluded: they render the
-    -- bullet-following beam locally, so the static relay beam would
-    -- double-render at the wrong speed/path.
-    local rf = RecipientFilter()
-    rf:AddPVS(pos)
-
-    for _, ply in ipairs(player.GetAll()) do
-        if IsValid(ply) and ply._lvsGredFxRendersTracers then
-            -- If RecipientFilter:RemovePlayer is unavailable on this build
-            -- the pcall keeps the player (status-quo duplicate at worst).
-            pcall(function() rf:RemovePlayer(ply) end)
-        end
-    end
-
-    net.Send(rf)
+    net.SendPVS(pos)
 end
 
 local function TryOverrideFireBullet()
