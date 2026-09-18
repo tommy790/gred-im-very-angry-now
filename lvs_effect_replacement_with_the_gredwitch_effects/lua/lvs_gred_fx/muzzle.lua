@@ -1,46 +1,49 @@
 --[[---------------------------------------------------------------------------
     LVS → Gredwitch FX : muzzle attachment resolution (client-side)
 
-    RAY-BASED RESOLUTION (rework)
+    RAY-BASED RESOLUTION + SNAPSHOT-TIME COMPENSATION
 
-    The old resolver ranked candidate attachments by plain point-to-point
-    distance to the muzzle source. On real vehicles that picks the wrong
-    attachment surprisingly often:
+    Two problems are solved here:
 
-      * attachments named "barrel" usually sit at the barrel ROOT (breech) —
-        on twin/quad mounts that root can be closer to the WRONG barrel's
-        muzzle source than to its own, so flashes and smoke glued to the
-        wrong (often hidden) attachment,
-      * hull/turret attachments near the shot line won distance ties,
-      * on long-barrelled guns, named attachments are spread along the whole
-        barrel axis, where point distance is meaningless.
+    (1) WRONG ATTACHMENT ID.
+        Ranking candidates by plain point distance to the muzzle source
+        picked "barrel"-named breech attachments, twin barrels on the wrong
+        side, etc. Candidates are now scored against the SHOT RAY
+        (perpendicular distance dominant, along-ray projection + "muzzle"
+        name bonus as tie-breaks). Priority:
 
-    The reworked resolver scores candidates against the SHOT RAY: origin =
-    muzzle source, direction = the bullet normal LVS passes in the EffectData
-    (callers now thread it through). The firing barrel's muzzle attachment
-    lies ON that ray, close to its origin; wrong attachments sit sideways
-    (large perpendicular distance) or far behind (breech). Priority order:
+          1. LVS-provided attachment id in the EffectData (validated)
+          2. Authoritative LVS muzzle attachment name
+             (ent.TurretBallisticsMuzzleAttachment) via LookupAttachment
+          3. Named "muzzle"/"barrel" candidates ranked by ray-fit
+          4. Static-barrel cache per local muzzle position
+          5. Generic nearest attachment (ray-fit ranking)
+          6. World-position fallback (caller logs why)
 
-      1. LVS-provided attachment id in the EffectData (validated: named,
-         near the source, and — when the direction is known — on the ray)
-      2. Authoritative LVS muzzle attachment name
-         (ent.TurretBallisticsMuzzleAttachment, e.g. "muzzle") via
-         ent:LookupAttachment(name), validated against the ray
-      3. Attachments whose name contains "muzzle"/"barrel", ranked by
-         ray-fit: perpendicular distance first (the firing barrel's tip is
-         ON the ray), then closeness to the muzzle tip along the ray, then a
-         small "muzzle"-name bonus over "barrel"-name matches. The per-shot
-         muzzle position still deterministically selects the correct barrel
-         on multi-barrel / alternating-barrel weapons.
-      4. Static-barrel cache per local muzzle position (resolves once per
-         physical barrel)
-      5. Generic nearest attachment (ray-fit ranking when the direction is
-         known; strict radius otherwise) for models with unnamed muzzles
-      6. World-position fallback (only when nothing valid was found — the
-         caller logs why)
+    (2) SNAPSHOT STALENESS ("wrong id when driving fast").
+        LVS fires the muzzle effect with a WORLD position snapshotted on the
+        SERVER at fire time (lvs_init.lua: SetOrigin(ent:LocalToWorld(...))).
+        The client resolves attachments ping/2+interp SECONDS later, against
+        bones that have already moved on. At speed that skew is 100+ units —
+        larger than multi-barrel spacing — so ANY world-space scoring
+        (point distance or ray) misaligns and picks the wrong attachment.
 
-    Callers that cannot supply a shot direction fall back to the old
-    point-distance behaviour, so they are never worse off than before.
+        Fix: we keep a short POSE HISTORY per recently-firing entity and
+        estimate the snapshot delay (ping/2 + max(cl_interp,
+        cl_interp_ratio/cl_updaterate), 0 in singleplayer). Before scoring,
+        the snapshot position AND direction are rigid-transformed from the
+        recorded pose at "fire time" into the CURRENT pose — compensating
+        translation AND rotation. Scoring then runs against current bones
+        with a consistent source/ray. (Bone-level turret animation relative
+        to the entity frame is unchanged — it was never the problem.)
+
+        The corrected position is returned as info.correctedPos so callers
+        can also place WORLD-space spawns (artillery blast, fallbacks) at
+        where the barrel actually is right now instead of where it was on
+        the server a snapshot ago.
+
+    Callers that cannot supply a shot direction fall back to point-distance
+    behaviour (with compensation still applied).
 
     The muzzle world position is only ever used to FIND the attachment; the
     actual particle is always spawned with PATTACH_POINT_FOLLOW once an
@@ -53,7 +56,8 @@
         position so the nearest-attachment scan runs at most once per barrel,
       * LookupAttachment for the LVS muzzle name is cheap and cached per
         entity+model as well,
-      * ray scoring is a handful of dots/lengths per candidate — cheap.
+      * pose history is kept ONLY for entities that fired within the last
+        second and pruned continuously.
 -----------------------------------------------------------------------------]]
 
 if not CLIENT then return end
@@ -82,6 +86,11 @@ local MUZZLE_NAME_BONUS   = 2
 
 -- Local-space quantization for the static-barrel cache.
 local LOCAL_CELL = 8
+
+-- Snapshot-compensation tuning.
+local POSE_HISTORY_TIME = 1.5  -- seconds of pose history kept per entity
+local TRACK_IDLE_TIME   = 1.0  -- stop tracking this long after last resolve
+local MAX_SNAPSHOT_DELAY = 0.5 -- sanity clamp for the estimated delay
 
 local function isMuzzleName(name)
     if not isstring(name) then return false end
@@ -201,6 +210,134 @@ local function lookupLvsMuzzleId(ent, cache)
 end
 
 --[[---------------------------------------------------------------------------
+    Snapshot-time compensation.
+
+    Per-entity pose history (entity origin + angles sampled every frame for
+    entities that fired recently) + a snapshot-delay estimate. Used to
+    rigid-transform the server-fire-time snapshot into the current frame
+    before any scoring happens.
+-----------------------------------------------------------------------------]]
+local POSE_HISTORY = setmetatable({}, { __mode = "k" }) -- ent → { {t,pos,ang}, ... }
+local TRACKED      = setmetatable({}, { __mode = "k" }) -- ent → last resolve time
+
+-- Estimated delay between "the server fired this shot" and "what the client
+-- is rendering right now": one-way ping + the interpolation window the
+-- rendered entity pose is lagging behind the server clock.
+local function EstimateSnapshotDelay()
+    if game.SinglePlayer() then return 0 end
+
+    local ply = LocalPlayer()
+    local ping = IsValid(ply) and ply:Ping() or 0
+
+    local function cvarNum(name, fallback)
+        local cv = GetConVar(name)
+        return cv and cv:GetFloat() or fallback
+    end
+
+    local interp     = cvarNum("cl_interp", 0.1)
+    local ratio      = cvarNum("cl_interp_ratio", 2)
+    local updaterate = math.max(cvarNum("cl_updaterate", 20), 1)
+
+    local lerp = math.max(interp, ratio / updaterate)
+
+    return math.Clamp(ping / 2000 + lerp, 0, MAX_SNAPSHOT_DELAY)
+end
+
+local function RecordPose(ent, now)
+    local hist = POSE_HISTORY[ent]
+    if not hist then
+        hist = {}
+        POSE_HISTORY[ent] = hist
+    end
+
+    local n = #hist
+    if n > 0 and hist[n].t >= now then return end -- already recorded this frame
+
+    hist[n + 1] = { t = now, pos = ent:GetPos(), ang = ent:GetAngles() }
+
+    while hist[1] and now - hist[1].t > POSE_HISTORY_TIME do
+        table.remove(hist, 1)
+    end
+end
+
+-- Keep pose history rolling only for entities that resolved recently.
+timer.Create("lvs_gred_fx_pose_track", 0, 0, function()
+    local now = CurTime()
+
+    for ent, lastUse in pairs(TRACKED) do
+        if not IsValid(ent) then
+            TRACKED[ent] = nil
+            POSE_HISTORY[ent] = nil
+        elseif now - lastUse > TRACK_IDLE_TIME then
+            TRACKED[ent] = nil
+            POSE_HISTORY[ent] = nil
+        else
+            RecordPose(ent, now)
+        end
+    end
+end)
+
+-- Recorded pose closest to (now - ago); nil when we have no history at all.
+local function PoseAt(ent, ago)
+    local hist = POSE_HISTORY[ent]
+    if not hist or #hist == 0 then return nil end
+
+    local target = CurTime() - ago
+    local best = hist[1]
+    local bestDelta = math.abs(best.t - target)
+
+    for i = 2, #hist do
+        local d = math.abs(hist[i].t - target)
+        if d < bestDelta then
+            best, bestDelta = hist[i], d
+        end
+    end
+
+    return best
+end
+
+-- dir_rotated ≈ (angTo * angFrom^-1) * dir, expressed via the world↔local
+-- helpers (rotating a vector by frame inverses; the position part is unused).
+local function RotateDirBetween(dir, angFrom, angTo)
+    local l = WorldToLocal(dir, angle_zero, vector_origin, angFrom)
+    return LocalToWorld(l, angle_zero, vector_origin, angTo)
+end
+
+-- Rigid-transform a server-fire-time snapshot position/direction into the
+-- entity's CURRENT frame. Returns correctedPos, correctedDir, compensated.
+local function CompensateSnapshot(ent, muzzlePos, dir)
+    local ago = EstimateSnapshotDelay()
+    if ago <= 0.005 then return muzzlePos, dir, false end
+
+    local pose = PoseAt(ent, ago)
+    if not pose then return muzzlePos, dir, false end
+
+    -- History frame is the current frame: no motion to compensate.
+    if CurTime() - pose.t <= 0.001 then return muzzlePos, dir, false end
+
+    -- Snapshot → entity-local (in the past frame) → back to world (in the
+    -- current frame): exact rigid compensation for translation + rotation.
+    local pastLocal = WorldToLocal(muzzlePos, angle_zero, pose.pos, pose.ang)
+    local cpos = LocalToWorld(pastLocal, angle_zero, ent:GetPos(), ent:GetAngles())
+
+    local cdir = dir
+    if isvector(dir) then
+        cdir = RotateDirBetween(dir, pose.ang, ent:GetAngles())
+    end
+
+    return cpos, cdir, true
+end
+
+-- Public helper for callers that need the compensated world position of a
+-- snapshot muzzle source (world-space spawns when no attachment resolved).
+function LVS_GRED_FX.CompensateMuzzleSnapshot(ent, muzzlePos, dir)
+    if not IsValid(ent) or not isvector(muzzlePos) then
+        return muzzlePos, dir, false
+    end
+    return CompensateSnapshot(ent, muzzlePos, dir)
+end
+
+--[[---------------------------------------------------------------------------
     Shot-ray helpers.
 -----------------------------------------------------------------------------]]
 local function normalizeDir(shotDir)
@@ -239,22 +376,26 @@ end
     ResolveMuzzleAttachment( ent, muzzlePos, effectDataAtt, shotDir )
 
       ent          — entity owning the attachments (pass the VEHICLE ROOT)
-      muzzlePos    — world muzzle source position (bullet.Src)
+      muzzlePos    — world muzzle source position; SERVER SNAPSHOT from the
+                     fire moment (it is rigid-compensated internally)
       effectDataAtt— attachment id carried in the EffectData (0 if none)
-      shotDir      — optional bullet direction (EffectData normal); enables
-                     ray-fit scoring and dramatically reduces wrong-id picks
+      shotDir      — optional bullet direction (EffectData normal), also
+                     snapshot-time; enables ray-fit scoring
 
     Returns: attachmentID, info
       info = {
-        method = "effectdata" | "lvs_muzzle_name" | "named_ray" |
-                "named_nearest" | "local_cache" | "nearest_ray" |
-                "nearest" | "none",
-        dist   = resolution distance (or nil),
-        name   = resolved attachment name (or nil),
+        method       = "effectdata" | "lvs_muzzle_name" | "named_ray" |
+                       "named_nearest" | "local_cache" | "nearest_ray" |
+                       "nearest" | "none",
+        dist         = resolution distance (or nil),
+        name         = resolved attachment name (or nil),
+        correctedPos = muzzlePos rigid-compensated into the current frame
+                       (use for world-space spawns, NOT for attachment math),
+        correctedDir = compensated direction, compensated = true/false,
       }
 
     attachmentID == 0 means "no usable attachment" — the caller must use the
-    world-position fallback.
+    world-position fallback (with info.correctedPos, not raw muzzlePos!).
 -----------------------------------------------------------------------------]]
 function LVS_GRED_FX.ResolveMuzzleAttachment(ent, muzzlePos, effectDataAtt, shotDir)
     if not IsValid(ent) then return 0, { method = "none", reason = "invalid entity" } end
@@ -262,14 +403,41 @@ function LVS_GRED_FX.ResolveMuzzleAttachment(ent, muzzlePos, effectDataAtt, shot
 
     local dir = normalizeDir(shotDir)
 
-    -- Debug: blue box = point-search area around the muzzle source; orange
-    -- line = the shot ray candidates are scored against.
+    -- Keep pose history rolling for this entity, then move the stale
+    -- snapshot source/direction into the current frame so scoring compares
+    -- like-with-like. This is the "wrong id when driving fast" fix.
+    TRACKED[ent] = CurTime()
+    RecordPose(ent, CurTime())
+
+    local cpos, cdir, compensated = CompensateSnapshot(ent, muzzlePos, dir)
+
+    local function pack(id, info)
+        if istable(info) then
+            info.correctedPos = cpos
+            info.correctedDir = cdir
+            info.compensated = compensated
+        end
+        return id, info
+    end
+
+    -- Debug: blue box = raw (stale) snapshot search area; red line = stale
+    -- ray; orange line = compensated ray actually used for scoring.
     if cfg.DebugEnabled() and debugoverlay then
         if debugoverlay.Box then
             debugoverlay.Box(muzzlePos, Vector(MAX_NAMED_DIST, MAX_NAMED_DIST, MAX_NAMED_DIST), 0.5, Color(0, 100, 255, 60))
         end
-        if dir and debugoverlay.Line then
-            debugoverlay.Line(muzzlePos, muzzlePos + dir * 256, 0.5, Color(255, 180, 0), true)
+        if debugoverlay.Line then
+            if dir then
+                debugoverlay.Line(muzzlePos, muzzlePos + dir * 256, 0.5, Color(255, 60, 30), true)
+            end
+            if cdir then
+                debugoverlay.Line(cpos, cpos + cdir * 256, 0.5, Color(255, 180, 0), true)
+            end
+        end
+        if compensated and LVS_GRED_FX.DebugOnce then
+            LVS_GRED_FX.DebugOnce("comp:" .. tostring(ent),
+                "snapshot compensated by", string.format("%.1f", math.sqrt(cpos:DistToSqr(muzzlePos))),
+                "units (est. delay)")
         end
     end
 
@@ -279,25 +447,25 @@ function LVS_GRED_FX.ResolveMuzzleAttachment(ent, muzzlePos, effectDataAtt, shot
     --    id, but it can be a stale/base-model id (e.g. lvs_2s38 sends id 1 —
     --    39 units away, empty name — which is a hull/root attachment, not the
     --    barrel). Validate it like the other paths: real name, close to the
-    --    source, and on the shot ray when the direction is known.
+    --    (compensated) source, and on the ray when the direction is known.
     if effectDataAtt and effectDataAtt > 0 then
         local att = LVS_GRED_FX.GetAttachmentData(ent, effectDataAtt)
         if att and att.Name and att.Name ~= "" then
-            local distSqr = att.Pos:DistToSqr(muzzlePos)
+            local distSqr = att.Pos:DistToSqr(cpos)
             local acceptable = distSqr <= MAX_EFFECTDATA_DIST * MAX_EFFECTDATA_DIST
 
-            if acceptable and dir then
-                local scored = scoreCandidate(att.Pos, muzzlePos, dir,
+            if acceptable and cdir then
+                local scored = scoreCandidate(att.Pos, cpos, cdir,
                     MAX_EFFECTDATA_PERP, -MAX_EFFECTDATA_DIST, MAX_EFFECTDATA_DIST)
                 acceptable = scored ~= nil
             end
 
             if acceptable then
-                return effectDataAtt, {
+                return pack(effectDataAtt, {
                     method = "effectdata",
                     dist = math.sqrt(distSqr),
                     name = att.Name,
-                }
+                })
             end
         end
     end
@@ -310,23 +478,23 @@ function LVS_GRED_FX.ResolveMuzzleAttachment(ent, muzzlePos, effectDataAtt, shot
         -- attachment is not the actual barrel muzzle (e.g. BMD-4 "muzzle" id
         -- 18u away).
         if att and att.Name and att.Name ~= "" then
-            local scored, perp = scoreCandidate(att.Pos, muzzlePos, dir,
-                dir and MAX_RAY_PERP or MAX_NAMED_DIST, RAY_ALONG_MIN, RAY_ALONG_MAX)
+            local scored, perp = scoreCandidate(att.Pos, cpos, cdir,
+                cdir and MAX_RAY_PERP or MAX_NAMED_DIST, RAY_ALONG_MIN, RAY_ALONG_MAX)
             if scored then
-                return lvsId, {
+                return pack(lvsId, {
                     method = "lvs_muzzle_name",
                     dist = perp,
                     name = att.Name,
-                }
+                })
             end
         end
     end
 
     -- 3) Named muzzle candidates ranked by ray-fit (or by point distance
     --    when no direction is known). Deterministic on multi-barrel
-    --    vehicles: each shot's ray lies on ITS barrel only.
+    --    vehicles: each shot's (compensated) ray lies on ITS barrel only.
     if cache.named and #cache.named > 0 then
-        local limit = dir and MAX_RAY_PERP or MAX_NAMED_DIST
+        local limit = cdir and MAX_RAY_PERP or MAX_NAMED_DIST
         local best, bestScore, bestName, bestPerp = 0, nil, nil, nil
         local dbg = cfg.DebugEnabled() and {} or nil
 
@@ -334,7 +502,7 @@ function LVS_GRED_FX.ResolveMuzzleAttachment(ent, muzzlePos, effectDataAtt, shot
             local id = cache.named[i]
             local att = LVS_GRED_FX.GetAttachmentData(ent, id)
             if att and att.Name and att.Name ~= "" then
-                local score, perp, along = scoreCandidate(att.Pos, muzzlePos, dir,
+                local score, perp, along = scoreCandidate(att.Pos, cpos, cdir,
                     limit, RAY_ALONG_MIN, RAY_ALONG_MAX)
                 if score then
                     if string.find(string.lower(att.Name), "muzzle", 1, true) then
@@ -364,22 +532,23 @@ function LVS_GRED_FX.ResolveMuzzleAttachment(ent, muzzlePos, effectDataAtt, shot
                             c.along and string.format("%.1f", c.along) or "n/a"))
                 end
             end
-            return best, {
-                method = dir and "named_ray" or "named_nearest",
+            return pack(best, {
+                method = cdir and "named_ray" or "named_nearest",
                 dist = bestPerp,
                 name = bestName,
-            }
+            })
         end
     end
 
     -- 4) Static-barrel cache: fixed local muzzle positions resolve once.
     --    The cache stores the resolved id AND the exact local position. A
-    --    cache hit is only accepted when the CURRENT muzzle local position is
-    --    within a few units of the cached one — this prevents two barrels
-    --    whose muzzles share an 8-unit cell (e.g. BMD-4M autocannon + main
-    --    cannon) from cross-returning each other's attachment id.
+    --    cache hit is only accepted when the CURRENT (compensated) muzzle
+    --    local position is within a few units of the cached one — this
+    --    prevents two barrels whose muzzles share an 8-unit cell (e.g.
+    --    BMD-4M autocannon + main cannon) from cross-returning each other's
+    --    attachment id.
     if ent.WorldToLocal then
-        local localPos = ent:WorldToLocal(muzzlePos)
+        local localPos = ent:WorldToLocal(cpos)
         local key = localKey(localPos)
         if key then
             local cached = cache.byLocal[key]
@@ -387,7 +556,7 @@ function LVS_GRED_FX.ResolveMuzzleAttachment(ent, muzzlePos, effectDataAtt, shot
                 if LVS_GRED_FX.ValidAttachment(ent, cached.id) and cached.pos and isvector(cached.pos) then
                     local drift = localPos:DistToSqr(cached.pos)
                     if drift <= 4 * 4 then -- within 4 units of the cached barrel
-                        return cached.id, { method = "local_cache", dist = nil, name = LVS_GRED_FX.AttachmentName(ent, cached.id) }
+                        return pack(cached.id, { method = "local_cache", dist = nil, name = LVS_GRED_FX.AttachmentName(ent, cached.id) })
                     end
                 end
                 cache.byLocal[key] = nil
@@ -398,7 +567,7 @@ function LVS_GRED_FX.ResolveMuzzleAttachment(ent, muzzlePos, effectDataAtt, shot
     -- 5) Generic nearest attachment (ray-fit when the direction is known,
     --    strict point radius otherwise) for models without named muzzles.
     if cache.atts and #cache.atts > 0 then
-        local limit = dir and MAX_RAY_PERP or MAX_GENERIC_DIST
+        local limit = cdir and MAX_RAY_PERP or MAX_GENERIC_DIST
         local best, bestScore, bestName, bestPerp = 0, nil, nil, nil
 
         for i = 1, #cache.atts do
@@ -406,7 +575,7 @@ function LVS_GRED_FX.ResolveMuzzleAttachment(ent, muzzlePos, effectDataAtt, shot
             if id and id > 0 then
                 local att = LVS_GRED_FX.GetAttachmentData(ent, id)
                 if att then
-                    local score, perp = scoreCandidate(att.Pos, muzzlePos, dir,
+                    local score, perp = scoreCandidate(att.Pos, cpos, cdir,
                         limit, RAY_ALONG_MIN, RAY_ALONG_MAX)
                     if score and (not bestScore or score < bestScore) then
                         best, bestScore, bestName, bestPerp = id, score, att.Name or "", perp
@@ -417,19 +586,19 @@ function LVS_GRED_FX.ResolveMuzzleAttachment(ent, muzzlePos, effectDataAtt, shot
 
         if best > 0 then
             if ent.WorldToLocal then
-                local localPos = ent:WorldToLocal(muzzlePos)
+                local localPos = ent:WorldToLocal(cpos)
                 local key = localKey(localPos)
                 if key then
                     cache.byLocal[key] = { id = best, pos = localPos }
                 end
             end
-            return best, {
-                method = dir and "nearest_ray" or "nearest",
+            return pack(best, {
+                method = cdir and "nearest_ray" or "nearest",
                 dist = bestPerp,
                 name = bestName,
-            }
+            })
         end
     end
 
-    return 0, { method = "none", reason = "no attachment near muzzle position" }
+    return pack(0, { method = "none", reason = "no attachment near muzzle position" })
 end

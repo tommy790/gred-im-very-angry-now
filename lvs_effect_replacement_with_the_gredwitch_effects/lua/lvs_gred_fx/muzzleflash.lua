@@ -169,6 +169,13 @@ function LVS_GRED_FX_MUZZLEFLASH.Spawn(effectName, self, data)
     -- (which frequently landed on the wrong barrel's attachment).
     local att, info = LVS_GRED_FX.ResolveMuzzleAttachment(rootEnt, muzzlePos, dataAtt, normal)
 
+    -- The resolver rigid-compensated the server-side snapshot into the
+    -- current frame: world-space spawns (artillery blast, fallbacks) must
+    -- use the COMPENSATED position or they lag behind the barrel at speed.
+    -- (Pairing below must keep the RAW muzzlePos — tracer records carry the
+    -- same un-compensated snapshot, so they match each other.)
+    local flashPos = (istable(info) and isvector(info.correctedPos)) and info.correctedPos or muzzlePos
+
     if cfg.DebugEnabled() then
         Debug("muzzle attachment:", "id:", att, "method:", info and info.method,
             "dist:", info and info.dist and string.format("%.1f", info.dist) or "n/a",
@@ -193,9 +200,9 @@ function LVS_GRED_FX_MUZZLEFLASH.Spawn(effectName, self, data)
     -- Spawn on rootEnt (the entity that owns the resolved attachment) so the
     -- PATTACH_POINT_FOLLOW id matches the entity.
     if isArtillery then
-        ok = spawnArtillery(rootEnt, muzzlePos, ang, att, cfg.ArtilleryLife)
+        ok = spawnArtillery(rootEnt, flashPos, ang, att, cfg.ArtilleryLife)
     else
-        ok = spawnFlash(pcf, rootEnt, muzzlePos, ang, att, cfg.FlashLife)
+        ok = spawnFlash(pcf, rootEnt, flashPos, ang, att, cfg.FlashLife)
     end
 
     -- Barrel smoke: separate system, resolved with its own attachment lookup,
@@ -206,6 +213,10 @@ function LVS_GRED_FX_MUZZLEFLASH.Spawn(effectName, self, data)
     -- at the same time). Passing the list and shot direction straight through:
     -- the smoke module filters unloadable PCFs (with a fallback chain) and
     -- re-uses the same ray for its own attachment resolution.
+    -- Smoke gets the RAW snapshot position: it compensates exactly once
+    -- internally (via its own resolve, or CompensateMuzzleSnapshot when the
+    -- flash already hand it a valid attachment). Passing flashPos here would
+    -- shift the smoke twice on the re-resolve path.
     local smokeList = (map and map.smoke) or cfg.DefaultSmokeByEffect[effectName]
     if cfg.SmokeEnabled() and smokeList then
         LVS_GRED_FX_BARRELSMOKE.Spawn(rootEnt, muzzlePos, att, smokeList, normal)
@@ -231,9 +242,9 @@ function LVS_GRED_FX_MUZZLEFLASH.Spawn(effectName, self, data)
                 or pcfNow == "gred_arti_muzzle_blast_alt"
 
             if artiNow then
-                spawnArtillery(rootEnt, muzzlePos, ang, att, cfg.ArtilleryLife)
+                spawnArtillery(rootEnt, flashPos, ang, att, cfg.ArtilleryLife)
             else
-                spawnFlash(pcfNow, rootEnt, muzzlePos, ang, att, cfg.FlashLife)
+                spawnFlash(pcfNow, rootEnt, flashPos, ang, att, cfg.FlashLife)
             end
 
             local smokeListNow = mapNow.smoke or cfg.DefaultSmokeByEffect[effectName]
@@ -246,7 +257,7 @@ function LVS_GRED_FX_MUZZLEFLASH.Spawn(effectName, self, data)
     -- Haubitze: also draw a short ballistic path beam in world space (this is
     -- a tracer-like visualization, not a muzzle-mounted particle).
     if effectName == "lvs_haubitze_muzzle" and isvector(normal) then
-        LVS_GRED_FX_MUZZLEFLASH.SpawnHaubitzeBeam(muzzlePos, normal)
+        LVS_GRED_FX_MUZZLEFLASH.SpawnHaubitzeBeam(flashPos, normal)
     end
 
     return ok
@@ -288,10 +299,13 @@ function LVS_GRED_FX_MUZZLEFLASH.SpawnGeneric(effectName, self, data)
 
     local att, info = LVS_GRED_FX.ResolveMuzzleAttachment(rootEnt, muzzlePos, dataAtt, normal)
 
+    -- Compensated (current-frame) muzzle position for world-space spawns.
+    local spawnPos = (istable(info) and isvector(info.correctedPos)) and info.correctedPos or muzzlePos
+
     if cfg.DebugEnabled() then
         Debug("generic muzzle effect:", effectName, "att:", att,
             "method:", info and info.method, "dist:", info and info.dist)
     end
 
-    return spawnGenericMuzzle(rootEnt, muzzlePos, ang, att)
+    return spawnGenericMuzzle(rootEnt, spawnPos, ang, att)
 end

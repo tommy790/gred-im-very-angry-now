@@ -101,7 +101,8 @@ local function CollectUsablePcfs(pcfList)
 end
 
 -- Spawn ONE smoke type; throttled and tracked per (ent, pcf).
-local function SpawnOne(ent, muzzlePos, smokeAtt, pcf, ang)
+-- worldPos is only used when no attachment resolved (world fallback).
+local function SpawnOne(ent, worldPos, smokeAtt, pcf, ang)
     local byPcf = ACTIVE[ent]
     if not byPcf then
         byPcf = {}
@@ -142,10 +143,10 @@ local function SpawnOne(ent, muzzlePos, smokeAtt, pcf, ang)
     if not psys then
         if cfg.DebugEnabled() then
             Debug("barrel smoke world fallback:", pcf,
-                "pos:", tostring(muzzlePos),
+                "pos:", tostring(worldPos),
                 "reason: no valid attachment", "att:", tostring(smokeAtt))
         end
-        psys = LVS_GRED_FX.SpawnWorld(pcf, muzzlePos, ang or angle_zero, cfg.SmokeLife, false)
+        psys = LVS_GRED_FX.SpawnWorld(pcf, worldPos, ang or angle_zero, cfg.SmokeLife, false)
     end
 
     if PsysValid(psys) then
@@ -162,7 +163,8 @@ end
     Spawn( ent, muzzlePos, att, pcfList, shotDir )
 
       ent       — entity owning the barrel (pass the VEHICLE ROOT)
-      muzzlePos — world muzzle source position
+      muzzlePos — world muzzle source position; MUST be the RAW EffectData
+                  snapshot (snapshot compensation happens here, exactly once)
       att       — already-resolved muzzle attachment id (0/nil → re-resolve)
       pcfList   — single PCF name or a list of names
       shotDir   — optional bullet direction; feeds the ray-fit resolver so
@@ -178,15 +180,29 @@ function LVS_GRED_FX_BARRELSMOKE.Spawn(ent, muzzlePos, att, pcfList, shotDir)
     -- Resolve the muzzle attachment independently of the flash system, but
     -- with the same shot direction: the ray-fit resolver picks the firing
     -- barrel's attachment, not the nearest-by-point-distance guess that used
-    -- to glue smoke to the wrong (often hidden) attachment.
+    -- to glue smoke to the wrong (often hidden) attachment. Compensation of
+    -- the server-side snapshot (muzzle.lua) happens EXACTLY ONCE, on
+    -- whichever path below runs — callers must pass the RAW EffectData
+    -- muzzle position, never a compensated one.
     local smokeAtt = att
+    local worldPos = muzzlePos -- used only if nothing attaches (fallback)
+
     if not smokeAtt or smokeAtt <= 0 then
-        smokeAtt = LVS_GRED_FX.ResolveMuzzleAttachment(ent, muzzlePos, 0, shotDir)
+        local info
+        smokeAtt, info = LVS_GRED_FX.ResolveMuzzleAttachment(ent, muzzlePos, 0, shotDir)
+        if istable(info) and isvector(info.correctedPos) then
+            worldPos = info.correctedPos
+        end
+    else
+        local cpos = LVS_GRED_FX.CompensateMuzzleSnapshot(ent, muzzlePos, shotDir)
+        if isvector(cpos) then
+            worldPos = cpos
+        end
     end
 
     local ang = isvector(shotDir) and shotDir:Angle() or nil
 
     for i = 1, #usable do
-        SpawnOne(ent, muzzlePos, smokeAtt, usable[i], ang)
+        SpawnOne(ent, worldPos, smokeAtt, usable[i], ang)
     end
 end
