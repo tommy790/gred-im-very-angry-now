@@ -1,56 +1,61 @@
 --[[---------------------------------------------------------------------------
     LVS → Gredwitch FX : muzzle attachment resolution (client-side)
 
-    STATIONARY POSE-MATCHED TWIN (5th generation).
+    STATIC-ORACLE TWIN (6th generation) — the dummy is COMPLETELY STATIC.
+
+    User decree: don't move any bone, don't move turrets, don't move the
+    hull, don't move the gun, don't move anything — the moment anything
+    poses, the ray is guaranteed to misalign.
 
     History of the bug: point-distance picked wrong ids; ray-fit on live
     attachments picked better but still wrong when live pose data was stale
-    or garbage (server snapshot evaluated ping/2+interp later against moved
-    bones; some LVS models return unposed/unnamed attachment data on the
-    live entity — BRDM-2's id 21 with attName "?" being the proof); a blind
-    cache then froze whatever won; and the first dummy design identified
-    attachments in the dummy's REFERENCE pose while the real turret was
-    traversed — the model-space ray then swept across the hull and glued to
-    whatever attachment happened to lie in its path.
+    or garbage (BRDM-2's id 21 with attName "?" is the proof some entities
+    return unposed data); a blind cache froze winners; a reference-pose
+    dummy let traversed turrets sweep the ray through the hull; and every
+    attempt to REPRODUCE the real pose on the dummy (current-pose mirror,
+    then fire-moment replay with recorded pose parameters) was one lag
+    away from misaligning again — client pose params, interpolation,
+    lag-comp: none of it provably equals the truth on the server at fire
+    time.
 
-    The current design:
+    The current design accepts that and turns it into armor:
 
-      RENDER A MODEL THAT IS NOT MOVING — BUT POSE IT LIKE THE REAL ONE.
-      For each model we lazily spawn a hidden, stationary ClientsideModel
-      copy far below the map. Before scoring, we MIRROR THE REAL ENTITY'S
-      POSE onto it: all pose parameters (LVS drives turrets with
-      SetPoseParameter — aim_yaw/aim_pitch/vehicle_steer ... the turret
-      BONE follows the pose parameter) and any bone manipulations. The
-      dummy stays world-stationary (no velocity, no interpolation, no
-      garbage pose data) but its turret sits at the SAME angle as the real
-      one — apples to apples at any traverse.
+      THE DUMMY NEVER MOVES. One hidden ClientsideModel per model, parked
+      far below the map, spawned once, posed once, left in reference pose
+      for the rest of the session.
 
-      SCORE IN MODEL SPACE, EVERY SHOT. The muzzle snapshot is converted
-      into the live entity's local frame (per hypothesis: raw + rigidly
-      motion-compensated; the better fit wins, raw wins ties) and ray-scored
-      against the posed dummy's attachment geometry. Geometry is memoized
-      per resolve, so scoring is cheap; NOTHING about identification is
-      cached across shots — a cache hit from a different turret angle is
-      exactly the 'wrong id' this file exists to kill. (Static metadata —
-      the attachment id/name list — is still cached per model; it never
-      changes.)
+      THE STATIC TWIN IS AN ORACLE FOR FRAME-STABLE BONDS ONLY. The ray
+      score can only succeed where an attachment's bond with the muzzle
+      point does NOT depend on turret pose (hull-mounted guns): those
+      candidates hug the point in every frame, forever. The moment a
+      relationship is pose-dependent (turret-mounted candidates), the
+      muzzle point rotates away from the frozen cluster as the turret
+      traverses, the window fails, and identification declines.
 
-      APPLY ONTO THE REAL MODEL. Attachment ids are model-static: the
-      winning id is used with PATTACH_POINT_FOLLOW on the REAL entity,
-      whose live turret bones the particle then follows exactly. Models
-      with no true muzzle attachment calibrate to a world-space spawn at
-      the live muzzle point — always at the firing barrel, never a wrong
-      attachment.
+      WHAT DECLINE MEANS: world-spawn at the live, motion-corrected firing
+      point. Correct flash at the true muzzle, attached to nothing, wrong
+      never. Not a fallback to mourn — for one-shot muzzle particles it is
+      visually identical to a perfect attach.
+
+      WHAT STILL MOVES: only the ROOT-frame compensation (hypothesis raw
+      vs motion-compensated, scored side by side, raw wins ties) — that
+      tracks vehicle translation/rotation, provable from pose history.
+      Never bones. Never pose parameters.
 
     Gates:
+      * facing: candidates must point along the shot (muzzle attachments
+        face out of the barrel) — hull furniture in the ray's path dies
+        here;
       * ambiguity: two different ids fitting near-equally → world-spawn
-        (a coin-flip glue IS the 'wrong id');
-      * attach distance: named/generic candidate perp over ATTACH_PERP_MAX
-        → world-spawn (a flash 10u+ off the muzzle point reads as wrong);
+        (a coin-flip glue IS the wrong id);
+      * attach distance: candidate perp over ATTACH_PERP_MAX → world-spawn
+        (8u; frame-stable bonds sit far closer, anything further is
+        pose-dependent or plain wrong);
       * authoritative ids (EffectData attachment, LVS
-        TurretBallisticsMuzzleAttachment) bypass both gates;
+        TurretBallisticsMuzzleAttachment) bypass both gates — the LVS
+        author's word stands;
       * degenerate live-entity pose data only matters for the no-dummy
-        fallback path (the posed dummy never degenerates).
+        fallback path (the static dummy never degenerates).
 
     Fallback when a dummy cannot be created: candidates are read from the
     live entity in its local frame with the degenerate-pose guard.
@@ -86,9 +91,13 @@ local RAY_ALONG_MAX       = 24   -- max projection ahead of the source
 local ATTACH_FACING_DOT   = 0.87
 
 -- Attach-vs-world gates (units / score points).
-local ATTACH_PERP_MAX     = 10   -- named/generic candidates further than this
+local ATTACH_PERP_MAX     = 8    -- named/generic candidates further than this
                                  -- from the muzzle point are NOT glued (the
-                                 -- BRDM-2 case: a "nearest" id 13u off).
+                                 -- BRDM-2 case: a "nearest" id 13.2u off).
+                                 -- Frame-stable muzzle attachments hug the
+                                 -- point; anything further is pose-dependent
+                                 -- or plain wrong → world-spawn at the point
+                                 -- (visually identical, wrong never).
 local AMBIGUITY_GAP       = 8    -- best vs second-best gap (different ids)
                                  -- below which the pick is a coin flip
                                  -- → world-spawn instead
@@ -171,96 +180,23 @@ local function DummyReady(dummy)
     return IsValid(dummy) and (dummy._lvsGredReady or 0) <= CurTime()
 end
 
--- Pose-parameter names are static per model; cached once so snapshotting
--- values every tick stays cheap. LVS drives turret bones with pose
--- parameters (aim_yaw / aim_pitch / vehicle_steer ...), so the values ARE
--- the turret traverse.
-local function PoseParamNames(ent, modelCache)
-    local names = modelCache.ppNames
-    if names then return names end
-
-    names = {}
-    if ent.GetNumPoseParameters and ent.GetPoseParameterName then
-        local n = ent:GetNumPoseParameters() or 0
-        for i = 0, n - 1 do
-            local name = ent:GetPoseParameterName(i)
-            if name then names[i + 1] = name end
-        end
-    end
-
-    modelCache.ppNames = names
-    return names
-end
-
--- Snapshot the current pose-parameter values (array parallel to names).
-local function SnapshotPoseParams(ent, names)
-    if #names == 0 or not ent.GetPoseParameter then return nil end
-
-    local pp = {}
-    for i = 1, #names do
-        pp[i] = ent:GetPoseParameter(names[i])
-    end
-    return pp
-end
-
--- Pose the dummy: with a recorded snapshot, freeze it at the FIRE-MOMENT
--- traverse (this is what makes the ray line up when the turret has moved
--- on since the shot was taken); without one, mirror the current pose.
--- Then copy any bone manipulations (addons that bypass pose parameters;
--- current values, rarely animated within a snapshot delay) and rebuild
--- the bone cache.
+-- THE DUMMY IS COMPLETELY STATIC — by user decree and by design:
+-- no pose parameters, no bone manipulations, no turret, no gun, nothing,
+-- ever. Any pose reproduction (current, fire-moment, estimated) can lag
+-- the truth on a moving turret, and a lagging reference GUARANTEES a
+-- misaligned ray.
 --
--- NO memoization: other resolvers (flash + smoke) share the same dummy on
--- the same frame and pose it for DIFFERENT hypotheses; a memo skip once
--- let a later resolve score its "current pose" frame against the stale
--- fire-moment pose the previous resolve left behind — a sweeping turret
--- then made the model-space ray sweep clean through the vehicle.
--- Mirroring is a handful of pose-parameter pokes + a bone rebuild: cheap.
-local function MirrorPose(ent, dummy, modelCache, ppSnapshot)
-    if not IsValid(dummy) then return end
+-- Instead the static twin acts as a geometric ORACLE for frame-stable
+-- relationships only: an attachment candidate stays inside the ray window
+-- for a given muzzle point ONLY if its bond with that muzzle does not
+-- depend on turret pose (hull-mounted guns — fine to attach, they can
+-- never fake-match). The moment anything is turret-mounted, traversing
+-- rotates the muzzle point away from the frozen candidate cluster, the
+-- window fails, and the resolver world-spawns the flash EXACTLY at the
+-- firing point. Nothing pose-dependent can ever attach — and nothing can
+-- misalign, because nothing tries to align.
 
-    local names = PoseParamNames(ent, modelCache)
-    if #names > 0 and dummy.SetPoseParameter then
-        for i = 1, #names do
-            local val = ppSnapshot and ppSnapshot[i] or (ent.GetPoseParameter and ent:GetPoseParameter(names[i])) or 0
-            pcall(dummy.SetPoseParameter, dummy, names[i], val)
-        end
-    end
-
-    if ent.GetManipulateBoneAngles and dummy.ManipulateBoneAngles then
-        local count = modelCache.boneCount
-        if count == nil then
-            count = (ent.GetBoneCount and ent:GetBoneCount()) or 0
-            modelCache.boneCount = count
-        end
-
-        for b = 0, count - 1 do
-            local ang = ent:GetManipulateBoneAngles(b)
-            if ang and (ang.p ~= 0 or ang.y ~= 0 or ang.r ~= 0) then
-                pcall(dummy.ManipulateBoneAngles, dummy, b, ang)
-            end
-
-            if ent.GetManipulateBonePosition and dummy.ManipulateBonePosition then
-                local pos = ent:GetManipulateBonePosition(b)
-                if pos and (pos.x ~= 0 or pos.y ~= 0 or pos.z ~= 0) then
-                    pcall(dummy.ManipulateBonePosition, dummy, b, pos)
-                end
-            end
-
-            if ent.GetManipulateBoneScale and dummy.ManipulateBoneScale then
-                local scl = ent:GetManipulateBoneScale(b)
-                if scl and (scl.x ~= 1 or scl.y ~= 1 or scl.z ~= 1) then
-                    pcall(dummy.ManipulateBoneScale, dummy, b, scl)
-                end
-            end
-        end
-    end
-
-    if dummy.InvalidateBoneCache then pcall(dummy.InvalidateBoneCache, dummy) end
-    if dummy.SetupBones then pcall(dummy.SetupBones, dummy) end
-end
-
--- Attachment data of the posed dummy, expressed in MODEL space
+-- Attachment data of the static dummy, expressed in MODEL space
 -- (dummy sits at angle_zero: world - origin is the exact model-local point
 -- and its Ang is the exact model-local Ang).
 local function DummyAttachmentData(dummy, attID)
@@ -281,7 +217,7 @@ end
     Per-MODEL metadata cache (attachment id/name list). Identification
     results are NOT cached — only facts about the model file itself.
 -----------------------------------------------------------------------------]]
-local MODEL_CACHE = {} -- model → { atts, dummy, boneCount }
+local MODEL_CACHE = {} -- model → { atts, dummy }
 
 local function GetModelCache(model, donor)
     local cache = MODEL_CACHE[model]
@@ -295,7 +231,6 @@ local function GetModelCache(model, donor)
     cache = {
         atts  = nil,
         dummy = nil,
-        boneCount = nil,
     }
     MODEL_CACHE[model] = cache
 
@@ -405,16 +340,7 @@ local function RecordPose(ent, now)
     local n = #hist
     if n > 0 and hist[n].t >= now then return end
 
-    -- Freeze the TURRET into the sample too: pose parameters drive the
-    -- turret bones, so the fire-moment traverse is recoverable from
-    -- history and can be replayed onto the dummy.
-    local pp = nil
-    local mc = ent.GetModel and GetModelCache(ent:GetModel(), ent) or nil
-    if mc then
-        pp = SnapshotPoseParams(ent, PoseParamNames(ent, mc))
-    end
-
-    hist[n + 1] = { t = now, pos = ent:GetPos(), ang = ent:GetAngles(), pp = pp }
+    hist[n + 1] = { t = now, pos = ent:GetPos(), ang = ent:GetAngles() }
 
     while hist[1] and now - hist[1].t > POSE_HISTORY_TIME do
         table.remove(hist, 1)
@@ -654,7 +580,6 @@ function LVS_GRED_FX.ResolveMuzzleAttachment(ent, muzzlePos, effectDataAtt, shot
             tag  = "raw",
             rpos = ent:GetPos(),
             rang = ent:GetAngles(),
-            pp   = nil,        -- use current pose parameters
             dpos = muzzlePos,  -- display / world-spawn position
             ddir = dir,
         },
@@ -667,12 +592,11 @@ function LVS_GRED_FX.ResolveMuzzleAttachment(ent, muzzlePos, effectDataAtt, shot
         if isvector(dir) then
             fdir = RotateDirBetween(dir, past.ang, ent:GetAngles())
         end
-        if fpos:DistToSqr(muzzlePos) > COMP_MIN_SHIFT_SQR or past.pp ~= nil then
+        if fpos:DistToSqr(muzzlePos) > COMP_MIN_SHIFT_SQR then
             hyps[2] = {
                 tag  = "compensated",
                 rpos = past.pos,
                 rang = past.ang,
-                pp   = past.pp,
                 dpos = fpos,
                 ddir = fdir,
             }
@@ -766,14 +690,8 @@ function LVS_GRED_FX.ResolveMuzzleAttachment(ent, muzzlePos, effectDataAtt, shot
     for h = 1, #hyps do
         local hyp = hyps[h]
 
-        -- FREEZE THE DUMMY'S TURRET at this frame's traverse before
-        -- touching its geometry: the recorded pose parameters are
-        -- replayed so the ray scores against the turret as it sat in
-        -- that moment, not as it sits now.
-        if IsValid(cache.dummy) then
-            MirrorPose(ent, cache.dummy, cache, hyp.pp)
-        end
-
+        -- The dummy is NEVER re-posed (see its declaration): candidates
+        -- are read from its frozen reference geometry exactly as-is.
         local cands, namedSet
         cands, namedSet, candSrc = BuildCandidates(ent, cache)
 
