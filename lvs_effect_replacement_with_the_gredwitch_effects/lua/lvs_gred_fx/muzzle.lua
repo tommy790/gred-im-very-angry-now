@@ -71,8 +71,19 @@ local MAX_EFFECTDATA_PERP = 64   -- EffectData attachment: ray sanity check
 local MAX_NAMED_DIST      = 32   -- named candidates without a direction
 local MAX_GENERIC_DIST    = 48   -- strict radius for unnamed models
 local MAX_RAY_PERP        = 40   -- ray-fit: max perpendicular distance
-local RAY_ALONG_MIN       = -64  -- max projection BEHIND the muzzle source
-local RAY_ALONG_MAX       = 48   -- max projection ahead of the source
+local RAY_ALONG_MIN       = -32  -- max projection BEHIND the muzzle source
+                                 -- (kept shallow: deep windows let the ray
+                                 -- reach into the hull and score bolts)
+local RAY_ALONG_MAX       = 24   -- max projection ahead of the source
+
+-- Facing gate: a muzzle attachment's orientation points OUT OF THE BARREL
+-- — along the shot. Hull/wheel attachments in the ray's path face random
+-- directions; requiring candidates to face along the shot kills the
+-- "wrong id standing in the ray's path" class entirely. dot threshold ≈
+-- 29° cone. Authoritative ids (EffectData/LVS name) are exempt (the LVS
+-- author already declared them the muzzle) and gate politely declines to
+-- world-spawn otherwise — never the wrong id.
+local ATTACH_FACING_DOT   = 0.87
 
 -- Attach-vs-world gates (units / score points).
 local ATTACH_PERP_MAX     = 10   -- named/generic candidates further than this
@@ -249,14 +260,20 @@ local function MirrorPose(ent, dummy, modelCache, ppSnapshot)
 end
 
 -- Attachment data of the posed dummy, expressed in MODEL space
--- (dummy sits at angle_zero: world - origin is the exact model-local point).
+-- (dummy sits at angle_zero: world - origin is the exact model-local point
+-- and its Ang is the exact model-local Ang).
 local function DummyAttachmentData(dummy, attID)
     if not attID or attID <= 0 then return nil end
 
     local ok, att = pcall(dummy.GetAttachment, dummy, attID)
     if not ok or not att or not isvector(att.Pos) then return nil end
 
-    return att.Pos - dummy:GetPos(), att.Name
+    local lfwd = nil
+    if isangle(att.Ang) then
+        lfwd = att.Ang:Forward()
+    end
+
+    return att.Pos - dummy:GetPos(), att.Name, lfwd
 end
 
 --[[---------------------------------------------------------------------------
@@ -516,10 +533,10 @@ local function BuildCandidates(ent, cache)
         for i = 1, #(cache.atts or {}) do
             local id = cache.atts[i] and cache.atts[i].id
             if id and id > 0 then
-                local lpos, name = DummyAttachmentData(dummy, id)
+                local lpos, name, lfwd = DummyAttachmentData(dummy, id)
                 if lpos then
                     name = cache.atts[i].name or name or ""
-                    cands[id] = { id = id, name = name, lpos = lpos }
+                    cands[id] = { id = id, name = name, lpos = lpos, lfwd = lfwd }
                     if isMuzzleName(name) then namedSet[id] = true end
                 end
             end
@@ -563,7 +580,14 @@ local function BuildCandidates(ent, cache)
                 local ad = LVS_GRED_FX.GetAttachmentData(ent, id)
                 if ad and ent.WorldToLocal then
                     local name = atts[i].name or ad.Name or ""
-                    cands[id] = { id = id, name = name, lpos = ent:WorldToLocal(ad.Pos) }
+                    local lfwd = nil
+                    if isangle(ad.Ang) then
+                        local p1 = ent:WorldToLocal(ad.Pos)
+                        local p2 = ent:WorldToLocal(ad.Pos + ad.Ang:Forward())
+                        local d = p2 - p1
+                        if d:LengthSqr() > 1e-6 then lfwd = d:GetNormalized() end
+                    end
+                    cands[id] = { id = id, name = name, lpos = ent:WorldToLocal(ad.Pos), lfwd = lfwd }
                     if isMuzzleName(name) then namedSet[id] = true end
                 end
             end
@@ -703,6 +727,20 @@ function LVS_GRED_FX.ResolveMuzzleAttachment(ent, muzzlePos, effectDataAtt, shot
     local candSrc
 
     local function consider(id, cand, lsrc, method, bonus, perpLimit, alongMin, alongMax)
+        -- Facing gate: non-authoritative candidates must POINT along the
+        -- shot (muzzle attachments face out of the barrel); anything in
+        -- the ray's path that faces another way is hull furniture, not a
+        -- muzzle — the shot line sweeping the vehicle can no longer score
+        -- it just for lying there.
+        if lsrc.ldir and cand.lfwd
+            and method ~= "effectdata" and method ~= "lvs_muzzle_name"
+            and cand.lfwd:Dot(lsrc.ldir) < ATTACH_FACING_DOT then
+            if dbg then
+                dbg[#dbg + 1] = { id = id, name = cand.name or "?", score = 9999, perp = -1, method = "rejected_facing", tag = lsrc.tag }
+            end
+            return
+        end
+
         local limit = perpLimit or (lsrc.ldir and MAX_RAY_PERP or MAX_NAMED_DIST)
         local score, perp = scoreCandidate(cand.lpos, lsrc.lpos, lsrc.ldir, limit, alongMin or RAY_ALONG_MIN, alongMax or RAY_ALONG_MAX)
         if not score then return end
