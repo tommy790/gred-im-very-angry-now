@@ -1,22 +1,46 @@
 --[[---------------------------------------------------------------------------
     LVS → Gredwitch FX : muzzle attachment resolution (client-side)
 
-    Resolves the correct weapon muzzle attachment for a given firing entity and
-    muzzle world position, following this priority order:
+    RAY-BASED RESOLUTION (rework)
 
-      1. LVS-provided attachment id in the EffectData  (validated: must exist
-         and sit close to the muzzle world position)
+    The old resolver ranked candidate attachments by plain point-to-point
+    distance to the muzzle source. On real vehicles that picks the wrong
+    attachment surprisingly often:
+
+      * attachments named "barrel" usually sit at the barrel ROOT (breech) —
+        on twin/quad mounts that root can be closer to the WRONG barrel's
+        muzzle source than to its own, so flashes and smoke glued to the
+        wrong (often hidden) attachment,
+      * hull/turret attachments near the shot line won distance ties,
+      * on long-barrelled guns, named attachments are spread along the whole
+        barrel axis, where point distance is meaningless.
+
+    The reworked resolver scores candidates against the SHOT RAY: origin =
+    muzzle source, direction = the bullet normal LVS passes in the EffectData
+    (callers now thread it through). The firing barrel's muzzle attachment
+    lies ON that ray, close to its origin; wrong attachments sit sideways
+    (large perpendicular distance) or far behind (breech). Priority order:
+
+      1. LVS-provided attachment id in the EffectData (validated: named,
+         near the source, and — when the direction is known — on the ray)
       2. Authoritative LVS muzzle attachment name
          (ent.TurretBallisticsMuzzleAttachment, e.g. "muzzle") via
-         ent:LookupAttachment(name), validated against the muzzle position
-      3. Attachments whose name contains "muzzle"/"barrel", picking the one
-         nearest to the muzzle position (this deterministically selects the
-         correct barrel on multi-barrel / alternating-barrel weapons, since
-         each shot's muzzle position identifies the barrel that fired)
-      4. Generic nearest attachment inside a strict radius (models that have
-         no named muzzle attachments, e.g. some mounted MG pods)
-      5. World-position fallback (only when nothing valid was found — the
+         ent:LookupAttachment(name), validated against the ray
+      3. Attachments whose name contains "muzzle"/"barrel", ranked by
+         ray-fit: perpendicular distance first (the firing barrel's tip is
+         ON the ray), then closeness to the muzzle tip along the ray, then a
+         small "muzzle"-name bonus over "barrel"-name matches. The per-shot
+         muzzle position still deterministically selects the correct barrel
+         on multi-barrel / alternating-barrel weapons.
+      4. Static-barrel cache per local muzzle position (resolves once per
+         physical barrel)
+      5. Generic nearest attachment (ray-fit ranking when the direction is
+         known; strict radius otherwise) for models with unnamed muzzles
+      6. World-position fallback (only when nothing valid was found — the
          caller logs why)
+
+    Callers that cannot supply a shot direction fall back to the old
+    point-distance behaviour, so they are never worse off than before.
 
     The muzzle world position is only ever used to FIND the attachment; the
     actual particle is always spawned with PATTACH_POINT_FOLLOW once an
@@ -28,7 +52,8 @@
       * static barrels (fixed local muzzle positions) are cached per local
         position so the nearest-attachment scan runs at most once per barrel,
       * LookupAttachment for the LVS muzzle name is cheap and cached per
-        entity+model as well.
+        entity+model as well,
+      * ray scoring is a handful of dots/lengths per candidate — cheap.
 -----------------------------------------------------------------------------]]
 
 if not CLIENT then return end
@@ -36,15 +61,24 @@ if not CLIENT then return end
 local cfg = LVS_GRED_FX.Config
 local Debug = LVS_GRED_FX.Debug
 
--- Tolerances (units).
+-- Tolerances (units) — point-distance behaviour (no shot direction known).
 local MAX_EFFECTDATA_DIST = 96   -- EffectData attachment must be near the muzzle
-local MAX_NAMED_DIST      = 32   -- "muzzle"/"barrel" named candidates: a real
-                                 -- muzzle is within a few units of bullet.Src;
-                                 -- 128 allowed far/wrong attachments (e.g. a
-                                 -- BMD-4 "muzzle" id 18 units away -> smoke on
-                                 -- the wrong spot). 32 still tolerates turret
-                                 -- pivot offset while rejecting non-muzzles.
+local MAX_NAMED_DIST      = 32   -- named candidates without a direction
 local MAX_GENERIC_DIST    = 48   -- strict radius for unnamed models
+
+-- Tolerances (units) — ray-fit behaviour (bullet direction known).
+local MAX_EFFECTDATA_PERP = 64   -- EffectData id: loose ray sanity check
+local MAX_RAY_PERP        = 40   -- named/generic candidates: max perpendicular
+                                 -- distance from the shot ray
+local RAY_ALONG_MIN       = -160 -- how far BEHIND the muzzle source a candidate
+                                 -- may project (long barrels, breech-side tips)
+local RAY_ALONG_MAX       = 48   -- how far ahead of the source it may project
+
+-- Score shaping: perpendicular fit dominates everything; along-ray closeness
+-- to the muzzle tip only breaks near-ties, and "muzzle" beats "barrel" on an
+-- exact tie.
+local ALONG_TIEBREAK      = 0.1
+local MUZZLE_NAME_BONUS   = 2
 
 -- Local-space quantization for the static-barrel cache.
 local LOCAL_CELL = 8
@@ -167,12 +201,54 @@ local function lookupLvsMuzzleId(ent, cache)
 end
 
 --[[---------------------------------------------------------------------------
-    ResolveMuzzleAttachment( ent, muzzlePos, effectDataAtt )
+    Shot-ray helpers.
+-----------------------------------------------------------------------------]]
+local function normalizeDir(shotDir)
+    if not isvector(shotDir) then return nil end
+    if shotDir:LengthSqr() < 0.25 then return nil end -- zero-ish normal: treat
+                                                      -- as "no direction"
+    return shotDir:GetNormalized()
+end
+
+-- Score a candidate attachment against the shot ray.
+-- Returns nil when the candidate is unusable, otherwise:
+--   score  — lower is better
+--   perp   — perpendicular distance to the ray (point distance without dir)
+--   along  — signed projection on the ray (nil without dir)
+local function scoreCandidate(attPos, muzzlePos, dir, perpLimit, alongMin, alongMax)
+    local to = attPos - muzzlePos
+
+    if not dir then
+        local d = to:Length()
+        if d > perpLimit then return nil end
+        return d, d, nil
+    end
+
+    local along = to:Dot(dir)
+    local perpSqr = to:LengthSqr() - along * along
+    if perpSqr < 0 then perpSqr = 0 end
+    local perp = math.sqrt(perpSqr)
+
+    if perp > perpLimit then return nil end
+    if along < alongMin or along > alongMax then return nil end
+
+    return perp + math.abs(along) * ALONG_TIEBREAK, perp, along
+end
+
+--[[---------------------------------------------------------------------------
+    ResolveMuzzleAttachment( ent, muzzlePos, effectDataAtt, shotDir )
+
+      ent          — entity owning the attachments (pass the VEHICLE ROOT)
+      muzzlePos    — world muzzle source position (bullet.Src)
+      effectDataAtt— attachment id carried in the EffectData (0 if none)
+      shotDir      — optional bullet direction (EffectData normal); enables
+                     ray-fit scoring and dramatically reduces wrong-id picks
 
     Returns: attachmentID, info
       info = {
-        method = "effectdata" | "lvs_muzzle_name" | "named_nearest" |
-                "local_cache" | "nearest" | "none",
+        method = "effectdata" | "lvs_muzzle_name" | "named_ray" |
+                "named_nearest" | "local_cache" | "nearest_ray" |
+                "nearest" | "none",
         dist   = resolution distance (or nil),
         name   = resolved attachment name (or nil),
       }
@@ -180,15 +256,21 @@ end
     attachmentID == 0 means "no usable attachment" — the caller must use the
     world-position fallback.
 -----------------------------------------------------------------------------]]
-function LVS_GRED_FX.ResolveMuzzleAttachment(ent, muzzlePos, effectDataAtt)
+function LVS_GRED_FX.ResolveMuzzleAttachment(ent, muzzlePos, effectDataAtt, shotDir)
     if not IsValid(ent) then return 0, { method = "none", reason = "invalid entity" } end
     if not isvector(muzzlePos) then return 0, { method = "none", reason = "invalid muzzle position" } end
 
-    -- Debug: draw a blue box showing the named-nearest attachment search
-    -- area (MAX_NAMED_DIST radius around the muzzle position), so it is easy
-    -- to see where the resolver is looking for the barrel attachment.
-    if cfg.DebugEnabled() and debugoverlay and debugoverlay.Box then
-        debugoverlay.Box(muzzlePos, Vector(MAX_NAMED_DIST, MAX_NAMED_DIST, MAX_NAMED_DIST), 0.5, Color(0, 100, 255, 60))
+    local dir = normalizeDir(shotDir)
+
+    -- Debug: blue box = point-search area around the muzzle source; orange
+    -- line = the shot ray candidates are scored against.
+    if cfg.DebugEnabled() and debugoverlay then
+        if debugoverlay.Box then
+            debugoverlay.Box(muzzlePos, Vector(MAX_NAMED_DIST, MAX_NAMED_DIST, MAX_NAMED_DIST), 0.5, Color(0, 100, 255, 60))
+        end
+        if dir and debugoverlay.Line then
+            debugoverlay.Line(muzzlePos, muzzlePos + dir * 256, 0.5, Color(255, 180, 0), true)
+        end
     end
 
     local cache = GetCache(ent)
@@ -196,16 +278,24 @@ function LVS_GRED_FX.ResolveMuzzleAttachment(ent, muzzlePos, effectDataAtt)
     -- 1) EffectData attachment id. LVS sometimes provides a muzzle attachment
     --    id, but it can be a stale/base-model id (e.g. lvs_2s38 sends id 1 —
     --    39 units away, empty name — which is a hull/root attachment, not the
-    --    barrel). Validate it like the other paths: real name AND close to
-    --    the muzzle position.
+    --    barrel). Validate it like the other paths: real name, close to the
+    --    source, and on the shot ray when the direction is known.
     if effectDataAtt and effectDataAtt > 0 then
         local att = LVS_GRED_FX.GetAttachmentData(ent, effectDataAtt)
         if att and att.Name and att.Name ~= "" then
-            local dist = att.Pos:DistToSqr(muzzlePos)
-            if dist <= MAX_EFFECTDATA_DIST * MAX_EFFECTDATA_DIST then
+            local distSqr = att.Pos:DistToSqr(muzzlePos)
+            local acceptable = distSqr <= MAX_EFFECTDATA_DIST * MAX_EFFECTDATA_DIST
+
+            if acceptable and dir then
+                local scored = scoreCandidate(att.Pos, muzzlePos, dir,
+                    MAX_EFFECTDATA_PERP, -MAX_EFFECTDATA_DIST, MAX_EFFECTDATA_DIST)
+                acceptable = scored ~= nil
+            end
+
+            if acceptable then
                 return effectDataAtt, {
                     method = "effectdata",
-                    dist = math.sqrt(dist),
+                    dist = math.sqrt(distSqr),
                     name = att.Name,
                 }
             end
@@ -216,46 +306,67 @@ function LVS_GRED_FX.ResolveMuzzleAttachment(ent, muzzlePos, effectDataAtt)
     local lvsId = lookupLvsMuzzleId(ent, cache)
     if lvsId > 0 then
         local att = LVS_GRED_FX.GetAttachmentData(ent, lvsId)
-        -- Require a real name AND proximity: an unnamed or far attachment is
-        -- not the actual barrel muzzle (e.g. BMD-4 "muzzle" id 18u away).
+        -- Require a real name AND ray/point fit: an unnamed or off-ray
+        -- attachment is not the actual barrel muzzle (e.g. BMD-4 "muzzle" id
+        -- 18u away).
         if att and att.Name and att.Name ~= "" then
-            local dist = att.Pos:DistToSqr(muzzlePos)
-            if dist <= MAX_NAMED_DIST * MAX_NAMED_DIST then
+            local scored, perp = scoreCandidate(att.Pos, muzzlePos, dir,
+                dir and MAX_RAY_PERP or MAX_NAMED_DIST, RAY_ALONG_MIN, RAY_ALONG_MAX)
+            if scored then
                 return lvsId, {
                     method = "lvs_muzzle_name",
-                    dist = math.sqrt(dist),
+                    dist = perp,
                     name = att.Name,
                 }
             end
         end
     end
 
-    -- 3) Named muzzle candidates nearest to the muzzle position. This handles
-    --    multi-barrel vehicles (muzzle, hull_muzzle, muzzle_coax, muzzle1/2...)
-    --    deterministically: each shot's muzzle position picks its own barrel.
-    --    Only attachments with a real name qualify (an unnamed id is not a
-    --    trustworthy muzzle).
+    -- 3) Named muzzle candidates ranked by ray-fit (or by point distance
+    --    when no direction is known). Deterministic on multi-barrel
+    --    vehicles: each shot's ray lies on ITS barrel only.
     if cache.named and #cache.named > 0 then
-        local best, bestDistSqr = 0, MAX_NAMED_DIST * MAX_NAMED_DIST
-        local bestName = nil
+        local limit = dir and MAX_RAY_PERP or MAX_NAMED_DIST
+        local best, bestScore, bestName, bestPerp = 0, nil, nil, nil
+        local dbg = cfg.DebugEnabled() and {} or nil
 
         for i = 1, #cache.named do
             local id = cache.named[i]
             local att = LVS_GRED_FX.GetAttachmentData(ent, id)
             if att and att.Name and att.Name ~= "" then
-                local d = att.Pos:DistToSqr(muzzlePos)
-                if d < bestDistSqr then
-                    bestDistSqr = d
-                    best = id
-                    bestName = att.Name
+                local score, perp, along = scoreCandidate(att.Pos, muzzlePos, dir,
+                    limit, RAY_ALONG_MIN, RAY_ALONG_MAX)
+                if score then
+                    if string.find(string.lower(att.Name), "muzzle", 1, true) then
+                        score = score - MUZZLE_NAME_BONUS
+                    end
+                    if dbg then
+                        dbg[#dbg + 1] = {
+                            id = id, name = att.Name,
+                            score = score, perp = perp, along = along,
+                        }
+                    end
+                    if not bestScore or score < bestScore then
+                        best, bestScore, bestName, bestPerp = id, score, att.Name, perp
+                    end
                 end
             end
         end
 
         if best > 0 then
+            if dbg then
+                table.sort(dbg, function(a, b) return a.score < b.score end)
+                for i = 1, math.min(#dbg, 4) do
+                    local c = dbg[i]
+                    Debug("muzzle cand:", c.name, "id:", c.id,
+                        string.format("score=%.1f perp=%.1f along=%s",
+                            c.score, c.perp or -1,
+                            c.along and string.format("%.1f", c.along) or "n/a"))
+                end
+            end
             return best, {
-                method = "named_nearest",
-                dist = math.sqrt(bestDistSqr),
+                method = dir and "named_ray" or "named_nearest",
+                dist = bestPerp,
                 name = bestName,
             }
         end
@@ -284,21 +395,21 @@ function LVS_GRED_FX.ResolveMuzzleAttachment(ent, muzzlePos, effectDataAtt)
         end
     end
 
-    -- 5) Generic nearest attachment inside a strict radius (unnamed models).
+    -- 5) Generic nearest attachment (ray-fit when the direction is known,
+    --    strict point radius otherwise) for models without named muzzles.
     if cache.atts and #cache.atts > 0 then
-        local best, bestDistSqr = 0, MAX_GENERIC_DIST * MAX_GENERIC_DIST
-        local bestName = nil
+        local limit = dir and MAX_RAY_PERP or MAX_GENERIC_DIST
+        local best, bestScore, bestName, bestPerp = 0, nil, nil, nil
 
         for i = 1, #cache.atts do
             local id = cache.atts[i] and cache.atts[i].id
             if id and id > 0 then
                 local att = LVS_GRED_FX.GetAttachmentData(ent, id)
                 if att then
-                    local d = att.Pos:DistToSqr(muzzlePos)
-                    if d < bestDistSqr then
-                        bestDistSqr = d
-                        best = id
-                        bestName = att.Name or ""
+                    local score, perp = scoreCandidate(att.Pos, muzzlePos, dir,
+                        limit, RAY_ALONG_MIN, RAY_ALONG_MAX)
+                    if score and (not bestScore or score < bestScore) then
+                        best, bestScore, bestName, bestPerp = id, score, att.Name or "", perp
                     end
                 end
             end
@@ -313,8 +424,8 @@ function LVS_GRED_FX.ResolveMuzzleAttachment(ent, muzzlePos, effectDataAtt)
                 end
             end
             return best, {
-                method = "nearest",
-                dist = math.sqrt(bestDistSqr),
+                method = dir and "nearest_ray" or "nearest",
+                dist = bestPerp,
                 name = bestName,
             }
         end

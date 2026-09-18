@@ -97,6 +97,16 @@ C.DefaultSmokeByEffect = {
     lvs_haubitze_muzzle = "vj_smoke_white_medium",
 }
 
+-- Fallback smoke PCFs, tried in order when EVERY configured smoke PCF for a
+-- muzzle effect fails to precache (e.g. the VJ smoke pack is not mounted).
+-- Keeps barrel smoke visible on any reasonably stocked client instead of
+-- silently never playing.
+C.SmokeFallbacks = {
+    "weapon_muzzle_smoke",
+    "vj_smoke_white_narrow",
+    "vj_smoke_white_medium",
+}
+
 C.DefaultMuzzleByEffect = {
     lvs_muzzle_colorable = "muzzleflash_bar_3p",
     lvs_pulserifle_muzzle = "muzzleflash_mg42_3p",
@@ -195,6 +205,16 @@ C.ScrapePcf       = "muzzleflash_sparks_variant_6"
 -- nothing. doi_smoke_artillery is gred-precached, 0 missing materials, and a
 -- continuous emitter — right for a canister that keeps re-firing.
 C.DefenceSmokePcf = "doi_smoke_artillery"
+
+-- Fallbacks tried in order when C.DefenceSmokePcf fails to precache on this
+-- client, so canister smoke screens never silently go missing. If ALL fail,
+-- the replacement is declined and the original LVS smoke effect plays.
+C.DefenceSmokeFallbacks = {
+    "doi_smoke_artillery",
+    "doi_smoke_grenade",
+    "weapon_muzzle_smoke",
+    "doi_ceilingDust_large",
+}
 C.StompDustPcf    = "doi_ceilingDust_large"
 C.RotorExplosionPcf = "high_explosive_air_2"
 

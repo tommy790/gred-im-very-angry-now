@@ -34,7 +34,12 @@ LVS_GRED_FX_TRACER = LVS_GRED_FX_TRACER or {}
 -- muzzle flashes and to infer caliber for impacts.
 local RECENT = setmetatable({}, { __mode = "k" })
 local RECENT_MAX_PER_ENT = 8
-local RECENT_WINDOW = 0.15
+-- Pairing window for muzzle-flash ↔ tracer records. 0.15s was too tight on
+-- laggy multiplayer / heavy frames: the muzzle effect missed its tracer
+-- record, no mapping paired, and barrel smoke (which needs the tracer's
+-- smoke list) silently never spawned. 0.3s is still far below any sane fire
+-- interval for two DIFFERENT weapon types on the same vehicle.
+local RECENT_WINDOW = 0.3
 
 -- Last shot per entity, no expiry — cheap caliber inference for impacts.
 local LAST_SHOT = setmetatable({}, { __mode = "k" })

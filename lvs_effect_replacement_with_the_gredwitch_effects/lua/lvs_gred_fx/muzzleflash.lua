@@ -5,10 +5,11 @@
     resolved muzzle attachment, so the flash stays glued to the barrel while
     the weapon traverses, elevates, recoils, animates or moves with the vehicle.
 
-    Resolution order (see muzzle.lua):
-      1. LVS EffectData attachment id (validated)
+    Resolution order (see muzzle.lua — ray-based scoring, bullet normal fed in):
+      1. LVS EffectData attachment id (validated: named, near source, on-ray)
       2. Authoritative LVS muzzle attachment name (TurretBallisticsMuzzleAttachment)
-      3. Named muzzle/barrel candidates nearest to the muzzle position
+      3. Named muzzle/barrel candidates ranked by ray-fit — perpendicular
+         distance to the shot ray, then closeness to the tip along it
          (correct barrel on multi-barrel / alternating-barrel weapons)
       4. Strict nearest attachment (models without named muzzles)
       5. World-position fallback — strictly last, always logged with the reason
@@ -163,7 +164,10 @@ function LVS_GRED_FX_MUZZLEFLASH.Spawn(effectName, self, data)
     local rootEnt = LVS_GRED_FX.VehicleRoot(ent)
 
     -- Resolve the correct muzzle attachment (never "attachment 1" guessing).
-    local att, info = LVS_GRED_FX.ResolveMuzzleAttachment(rootEnt, muzzlePos, dataAtt)
+    -- The bullet normal is threaded through so the resolver scores candidates
+    -- against the shot ray instead of picking the nearest-by-point-distance
+    -- (which frequently landed on the wrong barrel's attachment).
+    local att, info = LVS_GRED_FX.ResolveMuzzleAttachment(rootEnt, muzzlePos, dataAtt, normal)
 
     if cfg.DebugEnabled() then
         Debug("muzzle attachment:", "id:", att, "method:", info and info.method,
@@ -199,18 +203,12 @@ function LVS_GRED_FX_MUZZLEFLASH.Spawn(effectName, self, data)
     -- tracer-paired PCF(s), or the per-effect default (e.g. haubitze) when no
     -- tracer record has paired yet. The smoke field can be a single string or
     -- a list (cannons spawn BOTH vj_smoke_white_narrow and weapon_muzzle_smoke
-    -- at the same time).
+    -- at the same time). Passing the list and shot direction straight through:
+    -- the smoke module filters unloadable PCFs (with a fallback chain) and
+    -- re-uses the same ray for its own attachment resolution.
     local smokeList = (map and map.smoke) or cfg.DefaultSmokeByEffect[effectName]
     if cfg.SmokeEnabled() and smokeList then
-        if isstring(smokeList) then
-            smokeList = { smokeList }
-        end
-        for i = 1, #smokeList do
-            local pcf = smokeList[i]
-            if pcf and pcf ~= "" then
-                LVS_GRED_FX_BARRELSMOKE.Spawn(rootEnt, muzzlePos, att, pcf)
-            end
-        end
+        LVS_GRED_FX_BARRELSMOKE.Spawn(rootEnt, muzzlePos, att, smokeList, normal)
     end
 
     -- The tracer record sometimes arrives a frame after the muzzle effect
@@ -240,15 +238,7 @@ function LVS_GRED_FX_MUZZLEFLASH.Spawn(effectName, self, data)
 
             local smokeListNow = mapNow.smoke or cfg.DefaultSmokeByEffect[effectName]
             if cfg.SmokeEnabled() and smokeListNow then
-                if isstring(smokeListNow) then
-                    smokeListNow = { smokeListNow }
-                end
-                for i = 1, #smokeListNow do
-                    local pcf = smokeListNow[i]
-                    if pcf and pcf ~= "" then
-                        LVS_GRED_FX_BARRELSMOKE.Spawn(rootEnt, muzzlePos, att, pcf)
-                    end
-                end
+                LVS_GRED_FX_BARRELSMOKE.Spawn(rootEnt, muzzlePos, att, smokeListNow, normal)
             end
         end)
     end
@@ -291,12 +281,17 @@ function LVS_GRED_FX_MUZZLEFLASH.SpawnGeneric(effectName, self, data)
     if not isvector(muzzlePos) or not IsValid(ent) then return false end
 
     local ang = isvector(normal) and normal:Angle() or nil
-    local att, info = LVS_GRED_FX.ResolveMuzzleAttachment(ent, muzzlePos, dataAtt)
+
+    -- Resolve on the vehicle root too: third-party muzzle effects have the
+    -- same gunner-pod-vs-base-vehicle problem as the stock LVS ones.
+    local rootEnt = LVS_GRED_FX.VehicleRoot(ent)
+
+    local att, info = LVS_GRED_FX.ResolveMuzzleAttachment(rootEnt, muzzlePos, dataAtt, normal)
 
     if cfg.DebugEnabled() then
         Debug("generic muzzle effect:", effectName, "att:", att,
             "method:", info and info.method, "dist:", info and info.dist)
     end
 
-    return spawnGenericMuzzle(ent, muzzlePos, ang, att)
+    return spawnGenericMuzzle(rootEnt, muzzlePos, ang, att)
 end

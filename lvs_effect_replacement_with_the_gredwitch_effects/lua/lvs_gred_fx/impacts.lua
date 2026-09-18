@@ -201,8 +201,9 @@ local throttles = {}
 local throttleCount = 0
 
 -- Persistent defence-smoke systems: one continuous smoke cloud per canister
--- position. Keyed by a position cell so multiple canisters coexist; a sweeper
--- fades systems a few seconds after the canister stops re-firing.
+-- position. Keyed by a position cell so multiple canisters coexist; the
+-- sweeper below is the SOLE lifetime owner and fades systems a few seconds
+-- after the canister stops re-firing.
 local DEFENCE_SMOKE = {}
 
 -- Loose psys validity (particle handles are not entities).
@@ -215,6 +216,29 @@ local function PsysValidLoose(psys)
     return true
 end
 
+-- Pick a usable defence-smoke PCF: the configured one first, then the
+-- fallback chain. Preload caches both directions, so this is cheap even
+-- when called per canister fire.
+local function PickDefenceSmokePcf()
+    if isstring(cfg.DefenceSmokePcf) and LVS_GRED_FX.Preload(cfg.DefenceSmokePcf) then
+        return cfg.DefenceSmokePcf
+    end
+
+    local fallbacks = cfg.DefenceSmokeFallbacks or {}
+    for i = 1, #fallbacks do
+        local pcf = fallbacks[i]
+        if isstring(pcf) and pcf ~= "" and LVS_GRED_FX.Preload(pcf) then
+            LVS_GRED_FX.DebugOnce("defencesmokefallback",
+                "primary defence smoke PCF unavailable; using fallback:", pcf)
+            return pcf
+        end
+    end
+
+    return nil
+end
+
+-- Sweeper = the only thing that ever stops a defence-smoke system: ~3s after
+-- the canister's last re-fire (entries are refreshed while it keeps firing).
 timer.Create("lvs_gred_fx_defence_smoke_sweep", 1, 0, function()
     local now = CurTime()
     for key, sys in pairs(DEFENCE_SMOKE) do
@@ -383,11 +407,23 @@ local function dispatchOneShot(name, self, data)
     end
 
     if name == "lvs_defence_smoke" then
-        -- LVS re-fires this every 0.2s while the smoke canister is active.
-        -- A canister needs a CONTINUOUS smoke cloud, not throttled one-shot
-        -- puffs (which made it look like nothing). Keep ONE persistent smoke
-        -- system per canister position: start/refresh it on fire, and let it
-        -- fade out a few seconds after the canister stops re-firing.
+        -- LVS re-fires this every 0.2s while the smoke canister is active
+        -- (canisters live 10s+). A canister needs a CONTINUOUS smoke cloud,
+        -- not throttled one-shot puffs (which made it look like nothing).
+        -- Keep ONE persistent smoke system per canister position: refresh it
+        -- on fire; the sweeper fades it ~3s after the last fire.
+        --
+        -- TWO bugs killed this before:
+        --  * the system was spawned with a fixed 3s lifetime (StopAfter),
+        --    which stopped emission mid-canister while the table entry kept
+        --    "refreshing" a now-dead system — the smoke died for good after
+        --    3 seconds. The system now has NO scheduled kill: the sweeper
+        --    alone owns its lifetime.
+        --  * if "doi_smoke_artillery" failed to precache on a client, the
+        --    spawn silently returned nil and the original LVS effect was
+        --    already suppressed — no smoke at all. Now a fallback chain is
+        --    tried, and when nothing works we DECLINE the replacement so the
+        --    original LVS smoke still plays.
         if ThrottleAt(pos, "defence_smoke", 0.2) then
             local key = "defence_smoke:" .. math.floor(pos.x / 50) .. "," .. math.floor(pos.y / 50) .. "," .. math.floor(pos.z / 50)
             local sys = DEFENCE_SMOKE[key]
@@ -396,11 +432,25 @@ local function dispatchOneShot(name, self, data)
                 -- canister still active: refresh the fade-out deadline
                 sys.expires = CurTime() + 3
             else
-                -- start a new continuous smoke system
-                local psys = LVS_GRED_FX.SpawnWorld(cfg.DefenceSmokePcf, pos, angle_zero, 3, false)
-                if psys then
-                    DEFENCE_SMOKE[key] = { psys = psys, expires = CurTime() + 3 }
+                local pcf = PickDefenceSmokePcf()
+                if not pcf then
+                    LVS_GRED_FX.ReportError("lvs_defence_smoke replacement",
+                        "no usable defence smoke PCF on this client (tried " ..
+                        tostring(cfg.DefenceSmokePcf) .. " + fallbacks)")
+                    return false -- decline: let the original LVS smoke play
                 end
+
+                -- Start a new continuous smoke system. NO fixed lifetime:
+                -- the sweeper owns it and stops it ~3s after the canister
+                -- stops re-firing.
+                local psys = LVS_GRED_FX.SpawnWorld(pcf, pos, angle_zero, nil, false)
+                if not psys then
+                    LVS_GRED_FX.ReportError("lvs_defence_smoke spawn",
+                        "world particle create failed for " .. tostring(pcf))
+                    return false
+                end
+
+                DEFENCE_SMOKE[key] = { psys = psys, expires = CurTime() + 3 }
             end
         end
         return true

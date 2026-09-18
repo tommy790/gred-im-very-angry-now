@@ -2,10 +2,17 @@
     LVS → Gredwitch FX : barrel smoke (client-side)
 
     Fully independent of the muzzle-flash system. Barrel smoke resolves its
-    own muzzle attachment (muzzle.lua), attaches with PATTACH_POINT_FOLLOW and
+    own muzzle attachment with the same shot direction the flash used
+    (ray-based resolver, muzzle.lua), attaches with PATTACH_POINT_FOLLOW and
     stops itself after a fixed lifetime. One smoke column at a time per
-    (entity, attachment): firing again replaces the previous one so rapid
-    autocannon fire never stacks smoke systems.
+    (entity, pcf): firing again replaces the previous one so rapid fire never
+    stacks smoke systems.
+
+    Spawning accepts a single PCF name or a LIST of names (every loadable one
+    spawns, so cannons can keep their dual smoke look). When EVERY configured
+    PCF fails to precache (e.g. the VJ smoke pack is not mounted — the #1
+    reason smoke silently never played), the cfg.SmokeFallbacks chain is
+    tried so the shot still emits a smoke puff instead of nothing.
 
     Gated by the lvs_gred_fx_barrel_smoke cvar.
 -----------------------------------------------------------------------------]]
@@ -14,6 +21,7 @@ if not CLIENT then return end
 
 local cfg = LVS_GRED_FX.Config
 local Debug = LVS_GRED_FX.Debug
+local DebugOnce = LVS_GRED_FX.DebugOnce
 
 LVS_GRED_FX_BARRELSMOKE = LVS_GRED_FX_BARRELSMOKE or {}
 
@@ -56,12 +64,44 @@ timer.Create("lvs_gred_fx_smoke_sweep", 2, 0, function()
     end
 end)
 
-function LVS_GRED_FX_BARRELSMOKE.Spawn(ent, muzzlePos, att, pcf)
-    if not cfg.SmokeEnabled() then return end
-    if not IsValid(ent) or not isvector(muzzlePos) then return end
-    if not isstring(pcf) or pcf == "" then return end
-    if not LVS_GRED_FX.Preload(pcf) then return end
+-- Normalize the configured smoke name(s), keep only the ones that actually
+-- precache, and walk the fallback chain when none of them do.
+local function CollectUsablePcfs(pcfList)
+    local usable = {}
 
+    local function tryAdd(pcf)
+        if isstring(pcf) and pcf ~= "" and LVS_GRED_FX.Preload(pcf) then
+            usable[#usable + 1] = pcf
+        end
+    end
+
+    if isstring(pcfList) then
+        tryAdd(pcfList)
+    elseif istable(pcfList) then
+        for i = 1, #pcfList do
+            tryAdd(pcfList[i])
+        end
+    end
+
+    if #usable == 0 then
+        local fallbacks = cfg.SmokeFallbacks or {}
+        for i = 1, #fallbacks do
+            local pcf = fallbacks[i]
+            if isstring(pcf) and pcf ~= "" and LVS_GRED_FX.Preload(pcf) then
+                usable[1] = pcf
+                if DebugOnce then
+                    DebugOnce("smokefallback", "configured smoke PCFs unavailable; using fallback smoke:", pcf)
+                end
+                break
+            end
+        end
+    end
+
+    return usable
+end
+
+-- Spawn ONE smoke type; throttled and tracked per (ent, pcf).
+local function SpawnOne(ent, muzzlePos, smokeAtt, pcf, ang)
     local byPcf = ACTIVE[ent]
     if not byPcf then
         byPcf = {}
@@ -88,12 +128,6 @@ function LVS_GRED_FX_BARRELSMOKE.Spawn(ent, muzzlePos, att, pcf)
         byPcf[pcf] = nil
     end
 
-    -- Resolve the muzzle attachment independently of the flash system.
-    local smokeAtt = att
-    if not smokeAtt or smokeAtt <= 0 then
-        smokeAtt = LVS_GRED_FX.ResolveMuzzleAttachment(ent, muzzlePos, 0)
-    end
-
     local psys
     if smokeAtt and smokeAtt > 0 and LVS_GRED_FX.ValidAttachment(ent, smokeAtt) then
         -- forceHandle: smoke must be trackable so we can replace it later.
@@ -101,6 +135,7 @@ function LVS_GRED_FX_BARRELSMOKE.Spawn(ent, muzzlePos, att, pcf)
             life = cfg.SmokeLife,
             clear = false,
             forceHandle = true,
+            ang = ang,
         })
     end
 
@@ -110,7 +145,7 @@ function LVS_GRED_FX_BARRELSMOKE.Spawn(ent, muzzlePos, att, pcf)
                 "pos:", tostring(muzzlePos),
                 "reason: no valid attachment", "att:", tostring(smokeAtt))
         end
-        psys = LVS_GRED_FX.SpawnWorld(pcf, muzzlePos, angle_zero, cfg.SmokeLife, false)
+        psys = LVS_GRED_FX.SpawnWorld(pcf, muzzlePos, ang or angle_zero, cfg.SmokeLife, false)
     end
 
     if PsysValid(psys) then
@@ -120,5 +155,38 @@ function LVS_GRED_FX_BARRELSMOKE.Spawn(ent, muzzlePos, att, pcf)
             spawnedAt = CurTime(),
             expires = CurTime() + cfg.SmokeLife + 0.1,
         }
+    end
+end
+
+--[[---------------------------------------------------------------------------
+    Spawn( ent, muzzlePos, att, pcfList, shotDir )
+
+      ent       — entity owning the barrel (pass the VEHICLE ROOT)
+      muzzlePos — world muzzle source position
+      att       — already-resolved muzzle attachment id (0/nil → re-resolve)
+      pcfList   — single PCF name or a list of names
+      shotDir   — optional bullet direction; feeds the ray-fit resolver so
+                  smoke lands on the same barrel the flash did
+-----------------------------------------------------------------------------]]
+function LVS_GRED_FX_BARRELSMOKE.Spawn(ent, muzzlePos, att, pcfList, shotDir)
+    if not cfg.SmokeEnabled() then return end
+    if not IsValid(ent) or not isvector(muzzlePos) then return end
+
+    local usable = CollectUsablePcfs(pcfList)
+    if #usable == 0 then return end
+
+    -- Resolve the muzzle attachment independently of the flash system, but
+    -- with the same shot direction: the ray-fit resolver picks the firing
+    -- barrel's attachment, not the nearest-by-point-distance guess that used
+    -- to glue smoke to the wrong (often hidden) attachment.
+    local smokeAtt = att
+    if not smokeAtt or smokeAtt <= 0 then
+        smokeAtt = LVS_GRED_FX.ResolveMuzzleAttachment(ent, muzzlePos, 0, shotDir)
+    end
+
+    local ang = isvector(shotDir) and shotDir:Angle() or nil
+
+    for i = 1, #usable do
+        SpawnOne(ent, muzzlePos, smokeAtt, usable[i], ang)
     end
 end
