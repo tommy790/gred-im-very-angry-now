@@ -48,8 +48,10 @@
          world-spawn at the muzzle point. (Authoritative ids exempt.)
 
       5. Static-barrel cache: gated winners are remembered per local muzzle
-         position (drift-validated), so repeated shots from the same barrel
-         resolve in O(1).
+         position, but a cache hit is honoured ONLY when the cached id is
+         still a top-2, close, unambiguous candidate THIS frame — the cache
+         can accelerate, it can never decide (a blind hit pinned a garbage
+         id on every shot once; never again).
 
     info.sourcePos (alias correctedPos for older callers) always carries the
     WINNING hypothesis position for world-space spawns.
@@ -469,7 +471,10 @@ function LVS_GRED_FX.ResolveMuzzleAttachment(ent, muzzlePos, effectDataAtt, shot
     end
 
     -- Degenerate pose: EVERY attachment sits on the entity origin — the bone
-    -- data is garbage (unposed matrices). No id can be trusted.
+    -- data is garbage (unposed matrices). No id can be trusted. This check
+    -- (built on the SAME per-resolve memo data as scoring) runs BEFORE the
+    -- cache fast-path below: a cell validated as garbage can never poison
+    -- later shots.
     if cache.atts and #cache.atts >= 3 then
         local origin = ent:GetPos()
         local degenerate = true
@@ -488,30 +493,64 @@ function LVS_GRED_FX.ResolveMuzzleAttachment(ent, muzzlePos, effectDataAtt, shot
         end
     end
 
-    -- Static-barrel fast path: a previous GATED winner for this exact local
-    -- muzzle point, drift-validated. Checked per hypothesis.
-    if ent.WorldToLocal then
+    local cells = nil -- per-hypothesis local cells; filled lazily, reused
+                      -- by the winner-store below
+
+    -- Static-barrel fast path: a previous winner for this exact local muzzle
+    -- point. CRITICALLY: the cached id is only re-used when it is still one
+    -- of THIS FRAME's top-2 candidates with a credible score and no
+    -- ambiguous near-tie — i.e. it passes equivalent gates to a fresh pick.
+    -- (The old blind cache hit kept returning a degenerate/garbage id on
+    -- EVERY shot — the "wrong id every shot" bug — because nothing
+    -- re-validated it against the current frame.)
+    local function cacheFastPath(bestEntry, secondEntry)
+        if not ent.WorldToLocal then return end
+        if not bestEntry or not bestEntry.src then return end
+
+        local cachedId = nil
+
+        cells = {}
         for s = 1, #sources do
             local src = sources[s]
             local localPos = ent:WorldToLocal(src.pos)
             local key = localKey(localPos)
+            cells[#cells + 1] = { key = key, localPos = localPos, src = src }
+
             if key then
                 local cached = cache.byLocal[key]
                 if cached and cached.id and cached.pos and isvector(cached.pos) then
                     if localPos:DistToSqr(cached.pos) <= CACHE_DRIFT * CACHE_DRIFT then
-                        local att = getAtt(cached.id)
-                        if att then
-                            return pack(cached.id, {
-                                method = "local_cache",
-                                dist   = nil,
-                                name   = att.Name or "?",
-                            }, src)
-                        end
+                        cachedId = cached.id
+                    else
+                        cache.byLocal[key] = nil
                     end
-                    cache.byLocal[key] = nil
                 end
             end
         end
+
+        if not cachedId then return end
+        if not getAtt(cachedId) then return end
+
+        -- Still among this frame's top-2 candidates?
+        local isTop = bestEntry.id == cachedId
+            or (secondEntry and secondEntry.id == cachedId)
+        if not isTop then return end
+
+        -- Credible muzzle distance?
+        if (bestEntry.perp or 0) > ATTACH_PERP_MAX then return end
+
+        -- Not in an ambiguous near-tie with a DIFFERENT id?
+        if secondEntry and secondEntry.id ~= cachedId
+            and (secondEntry.score - bestEntry.score) <= AMBIGUITY_GAP then
+            return
+        end
+
+        local att = getAtt(cachedId)
+        return pack(cachedId, {
+            method = "local_cache",
+            dist   = bestEntry.perp,
+            name   = (att and att.Name) or "?",
+        }, bestEntry.src)
     end
 
     -- Unified scoring over all candidate classes and all hypotheses.
@@ -604,6 +643,13 @@ function LVS_GRED_FX.ResolveMuzzleAttachment(ent, muzzlePos, effectDataAtt, shot
         end
     end
 
+    -- Cache fast-path: hit only if the cached id survives THIS frame's
+    -- gates (top-2, close, unambiguous).
+    local cacheId, cacheInfo = cacheFastPath(best, second)
+    if cacheId then
+        return cacheId, cacheInfo
+    end
+
     local authoritative = best.method == "effectdata" or best.method == "lvs_muzzle_name"
 
     -- Ambiguity gate: two DIFFERENT attachments fit nearly equally → coin
@@ -628,12 +674,24 @@ function LVS_GRED_FX.ResolveMuzzleAttachment(ent, muzzlePos, effectDataAtt, shot
         }, best.src)
     end
 
-    -- GATED winner: remember it as a static barrel for O(1) repeat shots.
+    -- GATED winner: remember it as a static barrel for repeat shots. Only
+    -- ids that PASSED the gates above are ever stored, and the fast-path
+    -- revalidates against the current frame on every hit, so a stale cell
+    -- can never outlive its evidence.
     if ent.WorldToLocal then
-        local localPos = ent:WorldToLocal(best.src.pos)
-        local key = localKey(localPos)
-        if key then
-            cache.byLocal[key] = { id = best.id, pos = localPos }
+        if not cells then
+            cells = {}
+            for s = 1, #sources do
+                local src = sources[s]
+                local localPos = ent:WorldToLocal(src.pos)
+                cells[#cells + 1] = { key = localKey(localPos), localPos = localPos, src = src }
+            end
+        end
+        for i = 1, #cells do
+            local cell = cells[i]
+            if cell.src == best.src and cell.key then
+                cache.byLocal[cell.key] = { id = best.id, pos = cell.localPos }
+            end
         end
     end
 
