@@ -14,7 +14,9 @@
       * WantsOriginalThink(name)         — run original Think silently as the
                                            authoritative lifetime/behaviour
                                            oracle (tracers, trails, charge)
-      * Init / Think / Stop / Render     — replacement lifecycle
+      * Init / Think / Stop / Render     — replacement lifecycle (Render draws
+                                           the bullet-following tracer beam;
+                                           everything else is particle-based)
 
     Contract with the wrapper:
       Init returns false  → replacement declined; wrapper runs the original.
@@ -160,6 +162,11 @@ function LVS_GRED_FX.Stop(name, self)
 end
 
 function LVS_GRED_FX.Render(name, self)
-    -- Render is unused: all replacement visuals are particle systems, which
-    -- the engine renders itself.
+    -- Tracers: bullet-following beam drawn every frame at the live LVS
+    -- bullet position (speed/drop-exact — see tracer.lua).
+    if self._gmode == "tracer" and LVS_GRED_FX_TRACER and LVS_GRED_FX_TRACER.Render then
+        LVS_GRED_FX_TRACER.Render(self)
+        return
+    end
+    -- Everything else is particle-based; the engine renders those itself.
 end

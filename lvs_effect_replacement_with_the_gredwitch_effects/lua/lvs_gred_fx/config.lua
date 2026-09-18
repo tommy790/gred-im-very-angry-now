@@ -51,6 +51,43 @@ C.ColorIndex = {
 C.TracerDefaults = { color = "white", caliber = "20mm", muzzle = "muzzleflash_bar_3p" }
 
 --[[---------------------------------------------------------------------------
+    Bullet-following tracer beam (client renderer).
+
+    Gred's own gred_particle_tracer is a one-shot CP0→CP1 line particle: its
+    crossing speed is FIXED per caliber (~9200-23000 u/s effective) and it can
+    NOT arc — so it can never match LVS bullet velocity or drop. Clients
+    running this addon therefore render the beam themselves, following the
+    live client-simulated LVS bullet (bullet:GetPos()/GetDir() — the exact
+    same data LVS's own lvs_tracer_* effects use), which matches speed AND
+    drop by construction. The server relay keeps serving clients that don't
+    have the addon (they get the static gred beam as before).
+-----------------------------------------------------------------------------]]
+C.TracerBeamColors = {
+    red    = Color(255, 50, 20),
+    green  = Color(90, 255, 100),
+    white  = Color(255, 235, 200),
+    yellow = Color(255, 205, 70),
+}
+
+-- Beam length/width per caliber bucket.
+C.TracerBeamByCaliber = {
+    ["7mm"]  = { len = 700,  width = 2 },
+    ["12mm"] = { len = 900,  width = 2.5 },
+    ["20mm"] = { len = 1100, width = 3 },
+    ["30mm"] = { len = 1400, width = 4 },
+    ["40mm"] = { len = 1800, width = 5 },
+    ["50mm"] = { len = 1800, width = 5 },
+}
+
+-- Beam material candidates; first non-error wins. ins_tracer ships with
+-- gred's pack (additive tracer sprite); the LVS spark is the final fallback
+-- and is guaranteed present (LVS is a hard dependency).
+C.TracerBeamMaterials = {
+    "particles/ins_tracer",
+    "effects/lvs_base/spark",
+}
+
+--[[---------------------------------------------------------------------------
     Tracer mapping — the single source of truth for tracer replacement.
 
     Each LVS tracer maps to:

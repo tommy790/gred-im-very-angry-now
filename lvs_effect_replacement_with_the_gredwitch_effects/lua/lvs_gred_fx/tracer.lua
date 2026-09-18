@@ -1,15 +1,24 @@
 --[[---------------------------------------------------------------------------
     LVS → Gredwitch FX : tracer system (client-side)
 
-    THE PROVEN TRACER MECHANISM (restored from the original addon):
+    HOW TRACERS RENDER NOW (speed/drop-exact):
 
-    The actual gred tracer beam is rendered by GREDWITCH'S OWN BASE from the
-    server's gred_net_createtracer message (see lvs_gred_fx/sv_tracer.lua).
-    This module does NOT create any tracer particle system itself — it only:
+      * Clients RUNNING this addon render the beam themselves: every frame we
+        draw a gred-flavored tracer beam at the LIVE client-simulated LVS
+        bullet position/direction (bullet:GetPos()/GetDir()) — the exact same
+        data LVS's own lvs_tracer_* effects use. The beam follows the real
+        bullet, so SPEED and DROP always match, including ballistic arcs
+        (LVS re-derives bullet:GetDir() from the arc on every sim step).
+      * Clients WITHOUT the addon still get the static gred beam from the
+        server's gred_net_createtracer relay (sv_tracer.lua). That gred beam
+        is a one-shot CP0→CP1 line particle with a FIXED per-caliber crossing
+        speed and no gravity — it can never match LVS velocity/drop, which is
+        why addon clients are excluded from the relay via the
+        lvs_gred_fx_client_ready handshake.
 
-      * SUPPRESSES the original LVS tracer visual (the wrapper owns the effect
-        registration, so the original LVS beam never renders — no duplicate
-        LVS + Gred tracer),
+    This module also keeps its original duties:
+
+      * SUPPRESSES the original LVS tracer visual (we render instead),
       * keeps the LVS wrapper instance alive while the LVS bullet exists, so
         the override wrapper's silent original Think keeps firing
         lvs_bullet_impact_ap at LVS's exact timing and decides when the
@@ -17,10 +26,6 @@
       * records each shot (entity, muzzle position, tracer name, mapping) so
         the muzzle-flash system can pair the correct PCF and the impact
         system can pick the correct caliber.
-
-    This is the exact architecture that worked in the original addon:
-    rendering delegated to gred's own battle-tested pipeline, nothing fragile
-    to reimplement on the client.
 -----------------------------------------------------------------------------]]
 
 if not CLIENT then return end
@@ -173,6 +178,8 @@ function LVS_GRED_FX_TRACER.Init(name, self, data)
         srcPos = bullet.Src
     end
 
+    local dir = data.GetNormal and data:GetNormal() or nil
+
     local ent = bullet and bullet.Entity
     if not IsValid(ent) then
         ent = data.GetEntity and data:GetEntity() or nil
@@ -180,15 +187,30 @@ function LVS_GRED_FX_TRACER.Init(name, self, data)
 
     local map = cfg.Tracers[name] or cfg.TracerDefaults
 
+    -- Beam style for the bullet-following renderer (color + caliber-graded
+    -- length/width from config).
+    self._gcol = cfg.TracerBeamColors[(map and map.color) or "white"]
+        or cfg.TracerBeamColors.white
+    self._gstyle = cfg.TracerBeamByCaliber[(map and map.caliber) or "20mm"]
+        or { len = 1100, width = 3 }
+    self._gdir = isvector(dir) and dir or (bullet and bullet.Dir) or nil
+
+    -- Effects are only rendered when their bounds intersect the view; a
+    -- tracer covers a huge flight volume (LVS's own tracer effects set the
+    -- same 50000u render bounds).
+    if isvector(srcPos) and self.SetRenderBoundsWS then
+        local bdir = self._gdir or Vector(0, 0, 1)
+        self:SetRenderBoundsWS(srcPos, srcPos + bdir * 50000)
+    end
+
     -- Record the shot for muzzle-flash pairing and impact caliber inference.
     if IsValid(ent) and isvector(srcPos) then
         LVS_GRED_FX_TRACER.NoteShot(ent, name, srcPos, map)
     end
 
-    -- Suppress the LVS tracer visual. The gred beam arrives via the server's
-    -- gred_net_createtracer message; the wrapper's silent original Think
-    -- still drives the lifetime and fires lvs_bullet_impact_ap when the
-    -- bullet is gone.
+    -- The LVS tracer visual stays suppressed — we render in Render(). The
+    -- wrapper's silent original Think still drives the lifetime and fires
+    -- lvs_bullet_impact_ap when the bullet is gone.
     return true
 end
 
@@ -207,3 +229,73 @@ end
 function LVS_GRED_FX_TRACER.Stop(self)
     -- No client-owned particle system; nothing to stop.
 end
+
+--[[---------------------------------------------------------------------------
+    Bullet-following beam renderer (the speed/drop-exact path).
+
+    Draws exactly where the LIVE client-simulated LVS bullet is, along its
+    CURRENT flight direction — the same data LVS's own lvs_tracer_* effects
+    use (lvs_tracer_white.lua: bullet:GetPos()/GetDir()/GetLength() every
+    frame). Speed and drop therefore match the bullet by construction,
+    including ballistic arcs.
+
+    The look mirrors LVS's own tracer: a short bright beam trailing behind
+    the bullet head, drawn as outer glow + hot core.
+-----------------------------------------------------------------------------]]
+local beamMatCache = nil
+
+local function BeamMaterial()
+    if beamMatCache then return beamMatCache end
+
+    local candidates = cfg.TracerBeamMaterials or { "effects/lvs_base/spark" }
+    local mat
+    for i = 1, #candidates do
+        local m = Material(candidates[i])
+        if not m:IsError() then
+            mat = m
+            break
+        end
+    end
+
+    beamMatCache = mat or Material("effects/lvs_base/spark")
+    return beamMatCache
+end
+
+function LVS_GRED_FX_TRACER.Render(self)
+    local bullet = getBullet(self._bulletID)
+    if not bullet then return end
+
+    local pos = bullet.GetPos and bullet:GetPos() or bullet.Src
+    local dir = bullet.GetDir and bullet:GetDir() or bullet.Dir or self._gdir
+    if not isvector(pos) or not isvector(dir) then return end
+    if dir:LengthSqr() < 0.01 then return end
+
+    -- Same growth-in as LVS: shortens the beam for the first ~70ms of flight
+    -- so it doesn't streak across the whole map on frame one.
+    local grow = bullet.GetLength and bullet:GetLength() or 1
+
+    local style = self._gstyle
+    if not istable(style) then
+        style = { len = 1100, width = 3 }
+    end
+
+    local col = self._gcol or color_white
+
+    local len = style.len * grow
+    local tail = pos - dir * len
+    local head = pos + dir * len * 0.05 -- tiny hot overshoot at the head
+
+    render.SetMaterial(BeamMaterial())
+    -- outer glow, then hot core (gred beams read as bright core + halo)
+    render.DrawBeam(tail, head, style.width * 3.5, 0, 1, Color(col.r, col.g, col.b, 70))
+    render.DrawBeam(tail, head, style.width, 0, 1, Color(col.r, col.g, col.b, 255))
+end
+
+--[[---------------------------------------------------------------------------
+    Server handshake: announce that this client renders its own tracers, so
+    the server relay (sv_tracer.lua) excludes us from the static gred beam.
+-----------------------------------------------------------------------------]]
+hook.Add("InitPostEntity", "lvs_gred_fx_client_ready", function()
+    net.Start("lvs_gred_fx_client_ready")
+    net.SendToServer()
+end)
