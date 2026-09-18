@@ -208,15 +208,16 @@ end
 -- on since the shot was taken); without one, mirror the current pose.
 -- Then copy any bone manipulations (addons that bypass pose parameters;
 -- current values, rarely animated within a snapshot delay) and rebuild
--- the bone cache. Memoized per (entity, frame, target) — dual-hypothesis
--- resolves pose it twice per frame with different targets.
+-- the bone cache.
+--
+-- NO memoization: other resolvers (flash + smoke) share the same dummy on
+-- the same frame and pose it for DIFFERENT hypotheses; a memo skip once
+-- let a later resolve score its "current pose" frame against the stale
+-- fire-moment pose the previous resolve left behind — a sweeping turret
+-- then made the model-space ray sweep clean through the vehicle.
+-- Mirroring is a handful of pose-parameter pokes + a bone rebuild: cheap.
 local function MirrorPose(ent, dummy, modelCache, ppSnapshot)
     if not IsValid(dummy) then return end
-
-    local target = ppSnapshot or false
-    local memo = ent._lvsGredMirrorMemo
-    if memo and memo.frame == FrameNumber() and memo.pp == target then return end
-    ent._lvsGredMirrorMemo = { frame = FrameNumber(), pp = target }
 
     local names = PoseParamNames(ent, modelCache)
     if #names > 0 and dummy.SetPoseParameter then
