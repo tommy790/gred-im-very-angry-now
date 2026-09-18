@@ -160,26 +160,58 @@ local function DummyReady(dummy)
     return IsValid(dummy) and (dummy._lvsGredReady or 0) <= CurTime()
 end
 
--- Copy the REAL entity's pose onto the dummy: pose parameters first (this
--- is what makes the turret sit at the same angle), then explicit bone
--- manipulations for addons that bypass pose parameters. Then force the
--- bone cache to rebuild so attachment queries see the new pose.
--- Memoized per (entity, frame).
-local function MirrorPose(ent, dummy, modelCache)
-    if not IsValid(dummy) then return end
+-- Pose-parameter names are static per model; cached once so snapshotting
+-- values every tick stays cheap. LVS drives turret bones with pose
+-- parameters (aim_yaw / aim_pitch / vehicle_steer ...), so the values ARE
+-- the turret traverse.
+local function PoseParamNames(ent, modelCache)
+    local names = modelCache.ppNames
+    if names then return names end
 
-    local frame = FrameNumber()
-    if ent._lvsGredMirroredFrame == frame then return end
-    ent._lvsGredMirroredFrame = frame
-
-    if ent.GetNumPoseParameters and ent.GetPoseParameter
-        and ent.GetPoseParameterName and dummy.SetPoseParameter then
+    names = {}
+    if ent.GetNumPoseParameters and ent.GetPoseParameterName then
         local n = ent:GetNumPoseParameters() or 0
         for i = 0, n - 1 do
             local name = ent:GetPoseParameterName(i)
-            if name then
-                pcall(dummy.SetPoseParameter, dummy, name, ent:GetPoseParameter(name))
-            end
+            if name then names[i + 1] = name end
+        end
+    end
+
+    modelCache.ppNames = names
+    return names
+end
+
+-- Snapshot the current pose-parameter values (array parallel to names).
+local function SnapshotPoseParams(ent, names)
+    if #names == 0 or not ent.GetPoseParameter then return nil end
+
+    local pp = {}
+    for i = 1, #names do
+        pp[i] = ent:GetPoseParameter(names[i])
+    end
+    return pp
+end
+
+-- Pose the dummy: with a recorded snapshot, freeze it at the FIRE-MOMENT
+-- traverse (this is what makes the ray line up when the turret has moved
+-- on since the shot was taken); without one, mirror the current pose.
+-- Then copy any bone manipulations (addons that bypass pose parameters;
+-- current values, rarely animated within a snapshot delay) and rebuild
+-- the bone cache. Memoized per (entity, frame, target) — dual-hypothesis
+-- resolves pose it twice per frame with different targets.
+local function MirrorPose(ent, dummy, modelCache, ppSnapshot)
+    if not IsValid(dummy) then return end
+
+    local target = ppSnapshot or false
+    local memo = ent._lvsGredMirrorMemo
+    if memo and memo.frame == FrameNumber() and memo.pp == target then return end
+    ent._lvsGredMirrorMemo = { frame = FrameNumber(), pp = target }
+
+    local names = PoseParamNames(ent, modelCache)
+    if #names > 0 and dummy.SetPoseParameter then
+        for i = 1, #names do
+            local val = ppSnapshot and ppSnapshot[i] or (ent.GetPoseParameter and ent:GetPoseParameter(names[i])) or 0
+            pcall(dummy.SetPoseParameter, dummy, names[i], val)
         end
     end
 
@@ -355,7 +387,16 @@ local function RecordPose(ent, now)
     local n = #hist
     if n > 0 and hist[n].t >= now then return end
 
-    hist[n + 1] = { t = now, pos = ent:GetPos(), ang = ent:GetAngles() }
+    -- Freeze the TURRET into the sample too: pose parameters drive the
+    -- turret bones, so the fire-moment traverse is recoverable from
+    -- history and can be replayed onto the dummy.
+    local pp = nil
+    local mc = ent.GetModel and GetModelCache(ent:GetModel(), ent) or nil
+    if mc then
+        pp = SnapshotPoseParams(ent, PoseParamNames(ent, mc))
+    end
+
+    hist[n + 1] = { t = now, pos = ent:GetPos(), ang = ent:GetAngles(), pp = pp }
 
     while hist[1] and now - hist[1].t > POSE_HISTORY_TIME do
         table.remove(hist, 1)
@@ -563,24 +604,65 @@ function LVS_GRED_FX.ResolveMuzzleAttachment(ent, muzzlePos, effectDataAtt, shot
     TRACKED[ent] = CurTime()
     RecordPose(ent, CurTime())
 
-    local cpos, cdir, compensated = CompensateSnapshot(ent, muzzlePos, dir)
-
-    -- Hypotheses scored side by side; the better fit wins per shot.
-    local sources = {
-        { pos = muzzlePos, dir = dir, tag = "raw" },
-    }
-    if compensated then
-        sources[2] = { pos = cpos, dir = cdir, tag = "compensated" }
+    -- TWO FRAMES are scored, because the snapshot arrives ping/2+interp
+    -- late: the muzzle point (and the turret) may have moved since.
+    --   raw         — current root pose + current pose parameters;
+    --   compensated — the FIRE-MOMENT frame from our pose history: past
+    --                 root pos/ang AND the past pose-parameter values
+    --                 (the turret traverse at fire time), frozen onto the
+    --                 dummy while its ray is scored.
+    -- The better fit wins per shot; the raw frame wins exact ties, so a
+    -- wrong delay estimate can never displace a correct current fit.
+    local past = nil
+    do
+        local delay = EstimateSnapshotDelay()
+        if delay > 0.005 then
+            local sample = PoseAt(ent, delay)
+            if sample and CurTime() - sample.t > 0.001 then
+                past = sample
+            end
+        end
     end
 
-    local function pack(id, info, winSrc)
+    local hyps = {
+        {
+            tag  = "raw",
+            rpos = ent:GetPos(),
+            rang = ent:GetAngles(),
+            pp   = nil,        -- use current pose parameters
+            dpos = muzzlePos,  -- display / world-spawn position
+            ddir = dir,
+        },
+    }
+
+    if past then
+        local pastLocal = WorldToLocal(muzzlePos, angle_zero, past.pos, past.ang)
+        local fpos = LocalToWorld(pastLocal, angle_zero, ent:GetPos(), ent:GetAngles())
+        local fdir = dir
+        if isvector(dir) then
+            fdir = RotateDirBetween(dir, past.ang, ent:GetAngles())
+        end
+        if fpos:DistToSqr(muzzlePos) > COMP_MIN_SHIFT_SQR or past.pp ~= nil then
+            hyps[2] = {
+                tag  = "compensated",
+                rpos = past.pos,
+                rang = past.ang,
+                pp   = past.pp,
+                dpos = fpos,
+                ddir = fdir,
+            }
+        end
+    end
+
+    local function pack(id, info, winHyp)
         if istable(info) then
-            local sp = (winSrc and winSrc.pos) or cpos
+            local fallback = hyps[2] or hyps[1]
+            local sp = (winHyp and winHyp.dpos) or fallback.dpos
             info.sourcePos    = sp
             info.correctedPos = sp
-            info.correctedDir = (winSrc and winSrc.dir) or cdir
-            info.hypothesis   = winSrc and winSrc.tag or (compensated and "compensated" or "raw")
-            info.compensated  = (winSrc and winSrc.tag == "compensated") or false
+            info.correctedDir = (winHyp and winHyp.ddir) or fallback.ddir
+            info.hypothesis   = winHyp and winHyp.tag or fallback.tag
+            info.compensated  = (winHyp and winHyp.tag == "compensated") or false
         end
         return id, info
     end
@@ -589,51 +671,13 @@ function LVS_GRED_FX.ResolveMuzzleAttachment(ent, muzzlePos, effectDataAtt, shot
         if dir then
             debugoverlay.Line(muzzlePos, muzzlePos + dir * 256, 0.5, Color(255, 60, 30), true)
         end
-        if compensated and cdir then
-            debugoverlay.Line(cpos, cpos + cdir * 256, 0.5, Color(255, 180, 0), true)
+        if hyps[2] and hyps[2].ddir then
+            debugoverlay.Line(hyps[2].dpos, hyps[2].dpos + hyps[2].ddir * 256, 0.5, Color(255, 180, 0), true)
         end
     end
 
     local model = ent:GetModel()
     local cache = GetModelCache(model, ent)
-
-    -- The turret fix: pose the stationary dummy EXACTLY like the real
-    -- entity before touching its geometry. Without this the dummy sits in
-    -- reference pose and a traversed turret makes the model-space ray
-    -- sweep the hull and glue to whatever attachment lies in its path.
-    if IsValid(cache.dummy) then
-        MirrorPose(ent, cache.dummy, cache)
-    end
-
-    -- Model-space sources per hypothesis: local muzzle point + local dir
-    -- (the dir is rotated into local space via two WorldToLocal samples).
-    local localSrcs = {}
-    for s = 1, #sources do
-        local src = sources[s]
-        local lpos = ent:WorldToLocal(src.pos)
-        local ldir = nil
-        if src.dir then
-            local lpos2 = ent:WorldToLocal(src.pos + src.dir)
-            local d = lpos2 - lpos
-            if d:LengthSqr() > 1e-6 then
-                ldir = d:GetNormalized()
-            end
-        end
-        localSrcs[#localSrcs + 1] = { lpos = lpos, ldir = ldir, src = src }
-    end
-
-    local cands, namedSet, candSrc = BuildCandidates(ent, cache)
-
-    if candSrc == "degenerate" then
-        return pack(0, {
-            method = "degenerate",
-            reason = "all attachment positions degenerate (unposed bones)",
-        }, nil)
-    end
-
-    if next(cands) == nil then
-        return pack(0, { method = "none", reason = "no attachment data available" }, nil)
-    end
 
     -- Authoritative ids.
     local effectAtt = (effectDataAtt and effectDataAtt > 0) and effectDataAtt or nil
@@ -653,9 +697,10 @@ function LVS_GRED_FX.ResolveMuzzleAttachment(ent, muzzlePos, effectDataAtt, shot
         if lvsNameId == effectAtt then lvsNameId = nil end
     end
 
-    -- Unified scoring in MODEL space over all hypotheses.
+    -- Unified scoring in MODEL space over both frames.
     local best, second
     local dbg = cfg.DebugEnabled() and {} or nil
+    local candSrc
 
     local function consider(id, cand, lsrc, method, bonus, perpLimit, alongMin, alongMax)
         local limit = perpLimit or (lsrc.ldir and MAX_RAY_PERP or MAX_NAMED_DIST)
@@ -665,40 +710,77 @@ function LVS_GRED_FX.ResolveMuzzleAttachment(ent, muzzlePos, effectDataAtt, shot
         score = score - (bonus or 0)
 
         if dbg then
-            dbg[#dbg + 1] = { id = id, name = cand.name or "?", score = score, perp = perp, method = method, tag = lsrc.src.tag }
+            dbg[#dbg + 1] = { id = id, name = cand.name or "?", score = score, perp = perp, method = method, tag = lsrc.tag }
         end
 
-        -- Strictly-better wins: candidates from the RAW hypothesis (scanned
+        -- Strictly-better wins: candidates from the RAW frame (scanned
         -- first) win exact ties — wrong compensation can never displace a
         -- valid raw fit.
         if not best or score < best.score then
             second = best
-            best = { id = id, score = score, perp = perp, method = method, cand = cand, lsrc = lsrc }
+            best = { id = id, score = score, perp = perp, method = method, cand = cand, hyp = lsrc.hyp }
         elseif not second or score < second.score then
-            second = { id = id, score = score, perp = perp, method = method, cand = cand, lsrc = lsrc }
+            second = { id = id, score = score, perp = perp, method = method, cand = cand, hyp = lsrc.hyp }
         end
     end
 
-    for s = 1, #localSrcs do
-        local lsrc = localSrcs[s]
+    for h = 1, #hyps do
+        local hyp = hyps[h]
 
-        if effectAtt and cands[effectAtt] then
-            consider(effectAtt, cands[effectAtt], lsrc, "effectdata",
-                EFFECTDATA_BONUS, MAX_EFFECTDATA_PERP, -MAX_EFFECTDATA_DIST, MAX_EFFECTDATA_DIST)
+        -- FREEZE THE DUMMY'S TURRET at this frame's traverse before
+        -- touching its geometry: the recorded pose parameters are
+        -- replayed so the ray scores against the turret as it sat in
+        -- that moment, not as it sits now.
+        if IsValid(cache.dummy) then
+            MirrorPose(ent, cache.dummy, cache, hyp.pp)
         end
 
-        if lvsNameId and cands[lvsNameId] then
-            consider(lvsNameId, cands[lvsNameId], lsrc, "lvs_muzzle_name", LVS_NAME_BONUS)
+        local cands, namedSet
+        cands, namedSet, candSrc = BuildCandidates(ent, cache)
+
+        if candSrc == "degenerate" then
+            return pack(0, {
+                method = "degenerate",
+                reason = "all attachment positions degenerate (unposed bones)",
+            }, nil)
         end
 
-        for id, cand in pairs(cands) do
-            if id ~= effectAtt and id ~= lvsNameId then
-                if namedSet[id] then
-                    local bonus = string.find(string.lower(cand.name), "muzzle", 1, true) and MUZZLE_NAME_BONUS or 0
-                    consider(id, cand, lsrc, lsrc.ldir and "named_ray" or "named_nearest", bonus)
-                else
-                    local limit = lsrc.ldir and MAX_RAY_PERP or MAX_GENERIC_DIST
-                    consider(id, cand, lsrc, lsrc.ldir and "nearest_ray" or "nearest", 0, limit)
+        if next(cands) == nil then
+            if h == #hyps then
+                return pack(0, { method = "none", reason = "no attachment data available" }, nil)
+            end
+        else
+            -- Model-space source for this frame: localize the snapshot in
+            -- THIS frame's root pose, ray dir via a second WorldToLocal.
+            local lpos = WorldToLocal(muzzlePos, angle_zero, hyp.rpos, hyp.rang)
+            local ldir = nil
+            if dir then
+                local lpos2 = WorldToLocal(muzzlePos + dir, angle_zero, hyp.rpos, hyp.rang)
+                local d = lpos2 - lpos
+                if d:LengthSqr() > 1e-6 then
+                    ldir = d:GetNormalized()
+                end
+            end
+            local lsrc = { lpos = lpos, ldir = ldir, tag = hyp.tag, hyp = hyp }
+
+            if effectAtt and cands[effectAtt] then
+                consider(effectAtt, cands[effectAtt], lsrc, "effectdata",
+                    EFFECTDATA_BONUS, MAX_EFFECTDATA_PERP, -MAX_EFFECTDATA_DIST, MAX_EFFECTDATA_DIST)
+            end
+
+            if lvsNameId and cands[lvsNameId] then
+                consider(lvsNameId, cands[lvsNameId], lsrc, "lvs_muzzle_name", LVS_NAME_BONUS)
+            end
+
+            for id, cand in pairs(cands) do
+                if id ~= effectAtt and id ~= lvsNameId then
+                    if namedSet[id] then
+                        local bonus = string.find(string.lower(cand.name), "muzzle", 1, true) and MUZZLE_NAME_BONUS or 0
+                        consider(id, cand, lsrc, lsrc.ldir and "named_ray" or "named_nearest", bonus)
+                    else
+                        local limit = lsrc.ldir and MAX_RAY_PERP or MAX_GENERIC_DIST
+                        consider(id, cand, lsrc, lsrc.ldir and "nearest_ray" or "nearest", 0, limit)
+                    end
                 end
             end
         end
@@ -728,7 +810,7 @@ function LVS_GRED_FX.ResolveMuzzleAttachment(ent, muzzlePos, effectDataAtt, shot
             method = "ambiguous",
             reason = "near-tie between " .. tostring(best.cand.name) .. " and " .. tostring(second.cand.name),
             dist = best.perp,
-        }, best.lsrc.src)
+        }, best.hyp)
     end
 
     -- Attach-vs-world gate: a flash visibly displaced from the firing
@@ -738,7 +820,7 @@ function LVS_GRED_FX.ResolveMuzzleAttachment(ent, muzzlePos, effectDataAtt, shot
             method = "world",
             reason = string.format("best candidate '%s' %.0fu off the muzzle point", tostring(best.cand.name), best.perp or -1),
             dist = best.perp,
-        }, best.lsrc.src)
+        }, best.hyp)
     end
 
     -- The id must exist on the REAL entity too (should, same model).
@@ -747,12 +829,12 @@ function LVS_GRED_FX.ResolveMuzzleAttachment(ent, muzzlePos, effectDataAtt, shot
             method = "world",
             reason = "winning id invalid on the live entity",
             dist = best.perp,
-        }, best.lsrc.src)
+        }, best.hyp)
     end
 
     return pack(best.id, {
         method = best.method,
         dist   = best.perp,
         name   = best.cand.name,
-    }, best.lsrc.src)
+    }, best.hyp)
 end
