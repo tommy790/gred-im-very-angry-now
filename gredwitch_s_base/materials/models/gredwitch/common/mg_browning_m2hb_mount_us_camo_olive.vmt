@@ -1,0 +1,14 @@
+"patch"
+{
+	include "materials/models/gredwitch/common/base_wt.vmt"
+	insert
+	{
+	$basetexture				"models/gredwitch/common/mg_browning_m2hb_mount_c"
+	$bumpmap					"models/gredwitch/common/mg_browning_m2hb_mount_n"
+	
+	$detail 					"models/gredwitch/common/us_camo_olive"
+	$detailblendmode 			4
+	$alphatest					0
+	$nocull 					1
+}
+}

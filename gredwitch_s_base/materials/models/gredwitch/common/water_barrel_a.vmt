@@ -1,0 +1,10 @@
+"patch"
+{
+	include "materials/models/gredwitch/common/base_wt.vmt"
+	insert
+	{
+$basetexture				"models/gredwitch/common/water_barrel_a_c"
+$bumpmap					"models/gredwitch/common/water_barrel_a_n"
+
+	}
+}

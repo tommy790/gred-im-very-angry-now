@@ -1,0 +1,12 @@
+"patch"
+{
+	include "materials/models/gredwitch/common/base_wt.vmt"
+	insert
+	{
+	$basetexture				"models/gredwitch/common/us_m2_medium_track_c"
+	$bumpmap					"models/gredwitch/common/us_m2_medium_track_n"
+    $detailblendmode 			4
+	$detailscale				1.5
+
+}
+}
