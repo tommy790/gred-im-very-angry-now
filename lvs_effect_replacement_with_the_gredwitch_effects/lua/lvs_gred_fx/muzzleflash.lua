@@ -91,6 +91,11 @@ local function spawnFlash(pcf, ent, muzzlePos, ang, att, life)
     end
 
     -- No usable attachment: world-position fallback (documented last resort).
+    -- Chain BOTH spawn styles before declaring failure: returning false up
+    -- the chain makes the bridge replay the VANILLA effect — that is the
+    -- "full traverse replaces the flash with vanilla" report — so a handle
+    -- spawn miss must escalate to the classic fire-and-forget one-shot
+    -- first. Only an honest double failure hands the shot back to LVS.
     if cfg.DebugEnabled() then
         Debug("muzzle flash world fallback:", pcf,
             "pos:", tostring(muzzlePos),
@@ -98,7 +103,14 @@ local function spawnFlash(pcf, ent, muzzlePos, ang, att, life)
             "att:", tostring(att))
     end
 
-    return LVS_GRED_FX.SpawnWorld(pcf, muzzlePos, ang, life, true) ~= nil
+    if LVS_GRED_FX.SpawnWorld(pcf, muzzlePos, ang, life, true) then
+        return true
+    end
+    if LVS_GRED_FX.SpawnWorldOneShot(pcf, muzzlePos, ang) then
+        return true
+    end
+
+    return false
 end
 
 -- Spawn the full artillery muzzle flash: a single gred artillery blast

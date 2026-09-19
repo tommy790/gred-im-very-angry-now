@@ -547,13 +547,24 @@ function LVS_GRED_FX.ResolveMuzzleAttachment(ent, muzzlePos, effectDataAtt, shot
         end
     end
 
-    -- 3) + 4) The old-school nearest pick, radii-capped per class.
+    -- 3) + 4) The old-school nearest pick, radii-capped per class — with
+    -- ONE number added by the twin-cannon lesson: with two cannons on a
+    -- traversing ring, the FIRED gun's point slides around the arc and
+    -- ends up nearly as close to the OTHER cannon's frozen attachment —
+    -- "nearest" then glues the flash to the wrong side for both guns
+    -- ("slightly left → flash only on the left cannon"). So a pick only
+    -- wins when it is UNAMBIGUOUS: at least 2× closer than every rival id.
+    -- Anything less lands at step 5 → world-spawn at the snapshot point,
+    -- which already IS the correct side (and since the spawn chain was
+    -- hardened, that flash always plays instead of falling to vanilla).
     local bestNamed, bestNamedDist
     local bestAny, bestAnyDist
+    local results = {}
 
     for id, cand in pairs(cands) do
         if id ~= effectAtt and id ~= lvsNameId then
             local d = math.sqrt(cand.lpos:DistToSqr(lpos))
+            results[#results + 1] = { cand = cand, dist = d }
 
             if namedSet[id] then
                 if not bestNamedDist or d < bestNamedDist then
@@ -566,19 +577,53 @@ function LVS_GRED_FX.ResolveMuzzleAttachment(ent, muzzlePos, effectDataAtt, shot
         end
     end
 
+    local function rivalDist(winnerCand)
+        local r
+        for i = 1, #results do
+            if results[i].cand ~= winnerCand then
+                local d = results[i].dist
+                if not r or d < r then r = d end
+            end
+        end
+        return r
+    end
+
+    local function unambiguous(cand, dist)
+        local r = rivalDist(cand)
+        return (not r) or dist * 2 <= r
+    end
+
     if bestNamed and bestNamedDist <= MAX_NAMED_DIST then
-        return pack(bestNamed.id, {
-            method = "named",
+        if unambiguous(bestNamed, bestNamedDist) then
+            return pack(bestNamed.id, {
+                method = "named",
+                dist   = bestNamedDist,
+                name   = bestNamed.name,
+            })
+        end
+
+        return pack(0, {
+            method = "ambiguous",
+            reason = string.format("'%s' only %.1fu closer than a rival",
+                tostring(bestNamed.name), rivalDist(bestNamed) - bestNamedDist),
             dist   = bestNamedDist,
-            name   = bestNamed.name,
         })
     end
 
     if bestAny and bestAnyDist <= MAX_GENERIC_DIST then
-        return pack(bestAny.id, {
-            method = "nearest",
+        if unambiguous(bestAny, bestAnyDist) then
+            return pack(bestAny.id, {
+                method = "nearest",
+                dist   = bestAnyDist,
+                name   = bestAny.name,
+            })
+        end
+
+        return pack(0, {
+            method = "ambiguous",
+            reason = string.format("'%s' only %.1fu closer than a rival",
+                tostring(bestAny.name), rivalDist(bestAny) - bestAnyDist),
             dist   = bestAnyDist,
-            name   = bestAny.name,
         })
     end
 
